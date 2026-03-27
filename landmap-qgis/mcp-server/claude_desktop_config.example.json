@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "landmap": {
+      "command": "python",
+      "args": ["-m", "src.server"],
+      "cwd": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\landmap-qgis\\mcp-server",
+      "env": {
+        "LANDMAP_SHAPEFILE_DIR": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\shapefiles",
+        "LANDMAP_OUTPUT_DIR": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\output"
+      }
+    }
+  }
+}

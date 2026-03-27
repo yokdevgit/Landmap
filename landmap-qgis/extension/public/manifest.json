@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Landmap Scout",
+  "version": "1.0.0",
+  "description": "WMS Tile Collector for กรมที่ดิน with immediate download",
+  "permissions": [
+    "webRequest",
+    "storage",
+    "downloads",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "*://landsmaps.dol.go.th/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "index.html"
+  }
+}

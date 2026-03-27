@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pip install:*)",
+      "Bash(/usr/local/bin/pip3 install:*)",
+      "Bash(python3.9:*)",
+      "Bash(/mnt/c/Users/PKO-X1-Yoga-G6/AppData/Local/Programs/Python/Python313/python.exe -m src.server:*)"
+    ]
+  }
+}

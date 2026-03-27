@@ -1,0 +1,6 @@
+output/
+__pycache__/
+*.pyc
+*.pyo
+session_state.json
+*.zip

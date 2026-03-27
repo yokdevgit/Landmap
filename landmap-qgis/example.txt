@@ -1,0 +1,1 @@
+https://landsmaps.dol.go.th/geoserver/LANDSMAPS/wms?transparent=true&format=image%2Fpng&viewparams=utmmap%3A533938862&=&service=WMS&version=1.1.1&request=GetMap&styles=&layers=LANDSMAPS%3AV_PARCEL47&bbox=101.67846679687497%2C15.018310546874995%2C101.68945312500001%2C15.029296875000004&width=256&height=256&srs=EPSG%3A4326
