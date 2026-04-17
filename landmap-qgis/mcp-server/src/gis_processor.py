@@ -29,9 +29,10 @@ except ImportError:
 from .boundary_service import BoundaryService
 
 # Initialize boundary service
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SHAPEFILE_DIR = os.environ.get(
     "LANDMAP_SHAPEFILE_DIR",
-    r"C:\Users\intit\Desktop\landmap\landmap\shapefiles"
+    str(_REPO_ROOT / "shapefiles")
 )
 boundary_service = BoundaryService(SHAPEFILE_DIR)
 
@@ -585,23 +586,25 @@ class GISProcessor:
         }
 
     def _find_gdalbuildvrt(self) -> Optional[str]:
-        """Find gdalbuildvrt.exe — bundled with QGIS or on PATH."""
-        import shutil
-        # Common QGIS install locations on Windows
-        candidates = [
-            r"C:\Program Files\QGIS 3.40.15\bin\gdalbuildvrt.exe",
-            r"C:\Program Files\QGIS 3.38\bin\gdalbuildvrt.exe",
-            r"C:\Program Files\QGIS 3.36\bin\gdalbuildvrt.exe",
-            r"C:\OSGeo4W\bin\gdalbuildvrt.exe",
-        ]
-        import glob as _glob
-        for pattern in [r"C:\Program Files\QGIS*\bin\gdalbuildvrt.exe"]:
-            matches = _glob.glob(pattern)
+        """Find gdalbuildvrt — checks LANDMAP_GDAL_BIN env var, then common QGIS locations, then PATH."""
+        import shutil, glob as _glob
+        # Explicit override via env var (set this if auto-detection fails)
+        gdal_bin = os.environ.get("LANDMAP_GDAL_BIN", "")
+        if gdal_bin:
+            exe = Path(gdal_bin) / "gdalbuildvrt.exe"
+            if exe.exists():
+                return str(exe)
+            # Maybe they set it to the full binary path directly
+            if Path(gdal_bin).exists():
+                return gdal_bin
+        # Auto-detect: glob all installed QGIS versions on Windows
+        for pattern in [
+            r"C:\Program Files\QGIS*\bin\gdalbuildvrt.exe",
+            r"C:\OSGeo4W*\bin\gdalbuildvrt.exe",
+        ]:
+            matches = sorted(_glob.glob(pattern), reverse=True)  # newest first
             if matches:
                 return matches[0]
-        for c in candidates:
-            if Path(c).exists():
-                return c
         return shutil.which('gdalbuildvrt')
 
     def _generate_grid_shapefile(self, utmmaps: list[str], out_path: Path):

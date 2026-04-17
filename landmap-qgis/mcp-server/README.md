@@ -4,47 +4,33 @@ MCP Server สำหรับดึงข้อมูลแผนที่ที
 
 ## Requirements
 
-- **Python 3.10+** (required by MCP and Playwright)
-- Shapefile ของตำบล/อำเภอ/จังหวัดในประเทศไทย
-
-## Features
-
-- **ค้นหาพื้นที่**: ค้นหาจังหวัด อำเภอ ตำบล จาก shapefile
-- **หาพิกัด BBOX**: หาขอบเขตพิกัดของตำบล/อำเภอ/จังหวัด
-- **ดึงแผนที่**: ดึง tiles จากกรมที่ดินผ่าน headless browser
-- **สร้างไฟล์ GIS**: แปลงเป็น PNG + PGW + QLR สำหรับ QGIS
+- Python 3.10+
+- QGIS 3.36+ (ต้องการ `gdalbuildvrt` สำหรับสร้าง tile mosaic)
+- Playwright Chromium
 
 ## Installation
 
-### 1. ติดตั้ง Dependencies
-
 ```bash
-cd mcp-server
+cd landmap-qgis/mcp-server
 pip install -e .
-```
-
-หรือติดตั้ง dependencies โดยตรง:
-
-```bash
-pip install mcp geopandas playwright Pillow aiofiles
 playwright install chromium
 ```
 
-### 2. ตั้งค่า Environment Variables (Optional)
+## Configuration
 
-```bash
-# Path ไปยัง shapefile directory
-export LANDMAP_SHAPEFILE_DIR="C:\Users\PKO-X1-Yoga-G6\Desktop\landmap\shapefiles"
+### Environment variables
 
-# Path ไปยัง output directory
-export LANDMAP_OUTPUT_DIR="C:\Users\PKO-X1-Yoga-G6\Desktop\landmap\output"
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LANDMAP_SHAPEFILE_DIR` | `<repo>/shapefiles` | Path ไปยัง Thai admin boundary shapefiles |
+| `LANDMAP_OUTPUT_DIR` | `<repo>/output` | Path สำหรับบันทึก session output |
+| `LANDMAP_GDAL_BIN` | _(auto-detect)_ | Path ไปยัง directory ที่มี `gdalbuildvrt` — ตั้งเมื่อ QGIS ไม่ได้ติดตั้งใน `C:\Program Files\QGIS*` |
 
-### 3. ตั้งค่า Claude Desktop
+ดู `.env.example` สำหรับ template
 
-แก้ไขไฟล์ `claude_desktop_config.json`:
+### Claude Desktop (`claude_desktop_config.json`)
 
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`  
 **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
@@ -53,127 +39,81 @@ export LANDMAP_OUTPUT_DIR="C:\Users\PKO-X1-Yoga-G6\Desktop\landmap\output"
     "landmap": {
       "command": "python",
       "args": ["-m", "src.server"],
-      "cwd": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\landmap-qgis\\mcp-server",
+      "cwd": "C:\\path\\to\\landmap\\landmap-qgis\\mcp-server",
       "env": {
-        "LANDMAP_SHAPEFILE_DIR": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\shapefiles",
-        "LANDMAP_OUTPUT_DIR": "C:\\Users\\PKO-X1-Yoga-G6\\Desktop\\landmap\\output"
+        "LANDMAP_SHAPEFILE_DIR": "C:\\path\\to\\landmap\\shapefiles",
+        "LANDMAP_OUTPUT_DIR": "C:\\path\\to\\landmap\\output"
       }
     }
   }
 }
 ```
 
-### 4. Restart Claude Desktop
+> ถ้า `cwd` ตั้งค่าเป็น path ที่ถูกต้องและ `shapefiles/` กับ `output/` อยู่ใน repo root ตาม default layout ไม่จำเป็นต้องตั้ง env vars เลย
 
-ปิดและเปิด Claude Desktop ใหม่เพื่อโหลด MCP Server
+Restart Claude Desktop หลังแก้ไข config
 
 ## Available Tools
 
-### 1. `list_provinces`
-แสดงรายชื่อจังหวัดทั้งหมด 77 จังหวัด
+| Tool | Description |
+|------|-------------|
+| `list_provinces` | แสดงจังหวัดทั้งหมด 77 จังหวัด |
+| `list_districts` | แสดงอำเภอ/เขต ในจังหวัดที่ระบุ |
+| `list_subdistricts` | แสดงตำบล/แขวง ในอำเภอที่ระบุ |
+| `get_boundary_bbox` | หาขอบเขตพิกัด (BBOX) ของตำบล/อำเภอ/จังหวัด |
+| `search_location` | ค้นหาพื้นที่จากชื่อไทยหรืออังกฤษ |
+| `fetch_landmap_tiles` | ดึง tiles จากกรมที่ดิน |
+| `process_to_shapefiles` | แปลงข้อมูลเป็น shapefile + QGIS project (.qgs) |
+| `process_to_gis` | แปลง tiles เป็น PNG + PGW + QLR (legacy) |
+| `list_sessions` | แสดงรายการ sessions ที่ดึงไว้แล้ว |
 
-**ตัวอย่าง**: "แสดงรายชื่อจังหวัดทั้งหมด"
-
-### 2. `list_districts`
-แสดงรายชื่ออำเภอ/เขต ในจังหวัดที่ระบุ
-
-**ตัวอย่าง**: "แสดงอำเภอทั้งหมดในจังหวัดเชียงใหม่"
-
-### 3. `list_subdistricts`
-แสดงรายชื่อตำบล/แขวง ในอำเภอที่ระบุ
-
-**ตัวอย่าง**: "แสดงตำบลทั้งหมดในอำเภอเมือง จังหวัดเชียงใหม่"
-
-### 4. `get_boundary_bbox`
-หาขอบเขตพิกัด (BBOX) ของตำบล/อำเภอ/จังหวัด
-
-**ตัวอย่าง**: "หาพิกัดของตำบลบางนา กรุงเทพ"
-
-### 5. `search_location`
-ค้นหาตำบล/อำเภอ/จังหวัด จากชื่อ
-
-**ตัวอย่าง**: "ค้นหาพื้นที่ที่มีคำว่า บางนา"
-
-### 6. `fetch_landmap_tiles`
-ดึงแผนที่ที่ดินจากกรมที่ดิน
-
-**ตัวอย่าง**: "ดึงแผนที่ที่ดินตำบลบางนา กรุงเทพ ตั้งชื่อว่า bangna_session"
-
-### 7. `process_to_gis`
-แปลง tiles ที่ดึงมาเป็นไฟล์ GIS
-
-**ตัวอย่าง**: "แปลง session bangna_session เป็นไฟล์ GIS"
-
-### 8. `list_sessions`
-แสดงรายการ sessions ที่ดึงข้อมูลไว้แล้ว
-
-## Usage Examples
-
-### ดึงแผนที่ตำบล
-```
-User: ดึงแผนที่ที่ดินตำบลบางนา เขตบางนา กรุงเทพ
-
-Claude: [เรียก get_boundary_bbox เพื่อหาพิกัด]
-        [เรียก fetch_landmap_tiles เพื่อดึง tiles]
-        [เรียก process_to_gis เพื่อสร้างไฟล์ GIS]
-
-ผลลัพธ์: ไฟล์ ZIP ที่ C:\Users\...\output\bangna\bangna_gis.zip
-```
-
-### ค้นหาและดึงข้อมูล
-```
-User: ช่วยหาพื้นที่ "ลาดกระบัง" และดึงแผนที่ให้หน่อย
-
-Claude: [เรียก search_location เพื่อค้นหา]
-        พบ: ลาดกระบัง, เขตลาดกระบัง, กรุงเทพมหานคร
-        [เรียก fetch_landmap_tiles]
-        ...
-```
-
-## Output Files
-
-หลังจากเรียก `process_to_gis` จะได้ไฟล์:
+## Usage Example
 
 ```
-output/
-└── session_name/
-    ├── mission.json          # Metadata
-    ├── images/               # Raw tiles
-    │   ├── tile_0.png
-    │   ├── tile_1.png
-    │   └── ...
-    ├── gis/                  # GIS-ready files
-    │   ├── tile_0.png
-    │   ├── tile_0.pgw
-    │   ├── tile_1.png
-    │   ├── tile_1.pgw
-    │   ├── ...
-    │   └── landmap.qlr       # QGIS Layer Definition
-    └── session_name_gis.zip  # All GIS files bundled
+User: ดึงแผนที่ที่ดินตำบลบางแคเหนือ เขตบางแค กรุงเทพ
+
+Claude: [fetch_landmap_tiles → process_to_shapefiles]
+
+Output: output/bangkhaenuea/data/bangkhaenuea.qgs
 ```
 
-## วิธีใช้ใน QGIS
+เปิดไฟล์ `.qgs` ใน QGIS 3.36+ ได้เลย — project เปิดตรงพื้นที่ที่ถูกต้องพร้อม:
+- **DOL Tiles** — raster mosaic จาก WMS
+- **Boundary** — ขอบเขตตำบล/อำเภอ
+- **Parcel (DOL)** — แปลงที่ดินจาก WFS (ซ่อนไว้ by default, เปิดได้ใน Layers panel)
 
-1. แตกไฟล์ ZIP
-2. ลากไฟล์ `landmap.qlr` เข้า QGIS
-3. หรือใช้ Layer > Add Layer > Add Raster Layer > เลือก PNG ทั้งหมด
+## Output Structure
+
+```
+output/<session>/
+├── data/
+│   ├── parcel_dol.shp            แปลงที่ดิน (EPSG:4326)
+│   ├── parcel_dol_3857.geojson   แปลงที่ดิน (EPSG:3857 สำหรับ QGIS project)
+│   ├── boundary.shp              ขอบเขตพื้นที่ (EPSG:4326)
+│   ├── boundary_3857.geojson     ขอบเขตพื้นที่ (EPSG:3857 สำหรับ QGIS project)
+│   ├── grid_4000.csv             รายการ UTM map sheet IDs
+│   └── <session>.qgs             QGIS project file
+├── tiles_mosaic.vrt              GDAL VRT mosaic
+├── images/                       Raw tile PNGs
+└── <session>_shp.zip             ไฟล์ทั้งหมดใน ZIP
+```
 
 ## Troubleshooting
 
-### MCP Server ไม่เชื่อมต่อ
-- ตรวจสอบ path ใน `claude_desktop_config.json`
-- ตรวจสอบว่าติดตั้ง dependencies ครบ
+**MCP Server ไม่เชื่อมต่อ**
+- ตรวจสอบ `cwd` ใน `claude_desktop_config.json` ว่าชี้ไปยัง `landmap-qgis/mcp-server` ที่ถูกต้อง
+- ตรวจสอบว่าติดตั้ง dependencies ครบ (`pip install -e .`)
 - Restart Claude Desktop
 
-### ดึง tiles ไม่ได้
+**ดึง tiles ไม่ได้ / ได้ tiles น้อยมาก**
 - ตรวจสอบการเชื่อมต่อ internet
-- เว็บกรมที่ดินอาจมี rate limiting
-- ลองลด zoom level หรือลดขนาด bbox
+- เว็บกรมที่ดินอาจ rate limit — ลองใหม่อีกครั้ง (server ใช้ incognito browser ใหม่ทุก session)
 
-### ไม่พบจังหวัด/อำเภอ
-- ลองใช้ชื่อภาษาอังกฤษ
-- ใช้ search_location เพื่อค้นหา
+**QGIS project เปิดแล้ว layers ไม่แสดง**
+- ต้องใช้ QGIS 3.36 ขึ้นไป
+- ตรวจสอบว่า `tiles_mosaic.vrt` อยู่ใน session directory (ถ้าไม่มี gdalbuildvrt ทำงานล้มเหลว)
+- ตั้ง `LANDMAP_GDAL_BIN` ถ้า QGIS ไม่ได้ติดตั้งใน default location
 
-## License
-
-MIT
+**ไม่พบจังหวัด/อำเภอ/ตำบล**
+- ตรวจสอบว่า `LANDMAP_SHAPEFILE_DIR` ชี้ไปยัง directory ที่มี `.shp` files ถูกต้อง
+- ลองใช้ `search_location` เพื่อค้นหาชื่อที่ถูกต้อง

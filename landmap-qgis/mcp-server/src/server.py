@@ -22,13 +22,14 @@ from .tile_fetcher import TileFetcher
 from .gis_processor import GISProcessor
 
 # Initialize services
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SHAPEFILE_DIR = os.environ.get(
     "LANDMAP_SHAPEFILE_DIR",
-    r"C:\Users\intit\Desktop\landmap\landmap\shapefiles"
+    str(_REPO_ROOT / "shapefiles")
 )
 OUTPUT_DIR = os.environ.get(
     "LANDMAP_OUTPUT_DIR",
-    r"C:\Users\intit\Desktop\landmap\landmap\output"
+    str(_REPO_ROOT / "output")
 )
 
 boundary_service = BoundaryService(SHAPEFILE_DIR)
