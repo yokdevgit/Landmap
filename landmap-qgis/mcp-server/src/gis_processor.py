@@ -573,6 +573,26 @@ class GISProcessor:
             "layers": list(results.keys())
         }
 
+    def _find_gdalbuildvrt(self) -> Optional[str]:
+        """Find gdalbuildvrt.exe — bundled with QGIS or on PATH."""
+        import shutil
+        # Common QGIS install locations on Windows
+        candidates = [
+            r"C:\Program Files\QGIS 3.40.15\bin\gdalbuildvrt.exe",
+            r"C:\Program Files\QGIS 3.38\bin\gdalbuildvrt.exe",
+            r"C:\Program Files\QGIS 3.36\bin\gdalbuildvrt.exe",
+            r"C:\OSGeo4W\bin\gdalbuildvrt.exe",
+        ]
+        import glob as _glob
+        for pattern in [r"C:\Program Files\QGIS*\bin\gdalbuildvrt.exe"]:
+            matches = _glob.glob(pattern)
+            if matches:
+                return matches[0]
+        for c in candidates:
+            if Path(c).exists():
+                return c
+        return shutil.which('gdalbuildvrt')
+
     def _generate_grid_shapefile(self, utmmaps: list[str], out_path: Path):
         """Generate a grid attribute table (no geometry) for utmmap IDs found."""
         import sys
@@ -738,33 +758,145 @@ class GISProcessor:
                 'expanded': '1'
             })
 
-        # Raster tiles from gis/ folder — same files that work in process_to_gis QLR
-        # Use relative paths (./tile_N.png) since QGS lives in gis/ dir alongside tiles
-        tile_layer_entries = []  # (layer_id, tile_filename, bbox)
+        # Raster tiles: write per-tile VRTs → WGS84 mosaic → warp to EPSG:3857.
+        # Filtering to the dominant pixel size avoids gdalbuildvrt picking the
+        # coarsest resolution and shrinking all fine tiles to ~20px (invisible).
+        mosaic_layer_id = None
+        mosaic_merc_bbox = None  # extent in EPSG:3857 meters for QGS
+        wgs84_wkt_vrt = ('GEOGCS["WGS 84",DATUM["WGS_1984",'
+                         'SPHEROID["WGS 84",6378137,298.257223563]],'
+                         'PRIMEM["Greenwich",0],'
+                         'UNIT["degree",0.0174532925199433]]')
         if gis_dir and gis_dir.exists() and tiles and bbox and len(bbox) == 4:
             sess_min_lon, sess_min_lat, sess_max_lon, sess_max_lat = bbox
-            pad = 2.0
-            valid_tiles = [
+            # Small pad — only include tiles that fall inside (or just touch) the session bbox
+            pad = 0.05
+            candidate_tiles = [
                 t for t in tiles
                 if (t['bbox'][0] >= sess_min_lon - pad and
                     t['bbox'][2] <= sess_max_lon + pad and
                     t['bbox'][1] >= sess_min_lat - pad and
                     t['bbox'][3] <= sess_max_lat + pad)
             ]
-            print(f"Adding {len(valid_tiles)}/{len(tiles)} tiles to QGS", file=sys.stderr)
-            for i, tile in enumerate(valid_tiles):
-                # gis/ folder has tile_N.png + tile_N.pgw (created by process_session)
-                gis_png = Path(tile['fileName']).name  # e.g. tile_0.png
-                tile_id = f"dol_tile_{i}"
-                ET.SubElement(layer_tree_group, 'layer-tree-layer', {
-                    'name': f"DOL tile {i}",
-                    'id': tile_id,
-                    'checked': 'Qt::Checked',
-                    'source': f"./{gis_png}",
-                    'providerKey': 'gdal',
-                    'expanded': '0'
-                })
-                tile_layer_entries.append((tile_id, gis_png, tile['bbox']))
+
+            # Find dominant pixel size (most common zoom level) and filter to ±20%
+            from collections import Counter
+            px_sizes = [round((t['bbox'][2]-t['bbox'][0]) / t.get('width', 256), 10)
+                        for t in candidate_tiles]
+            dominant_px = Counter(px_sizes).most_common(1)[0][0] if px_sizes else None
+            if dominant_px:
+                valid_tiles = [
+                    t for t, px in zip(candidate_tiles, px_sizes)
+                    if abs(px - dominant_px) <= dominant_px * 0.2
+                ]
+            else:
+                valid_tiles = candidate_tiles
+            print(f"Building mosaic: {len(valid_tiles)} tiles at px={dominant_px:.8f} deg/px "
+                  f"(filtered from {len(tiles)} total)", file=sys.stderr)
+
+            vrt_paths = []
+            for tile in valid_tiles:
+                gis_png = Path(tile['fileName']).name
+                vrt_name = gis_png.replace('.png', '.vrt')
+                vrt_path = gis_dir / vrt_name
+                tb = tile['bbox']
+                w = tile.get('width', 256)
+                h = tile.get('height', 256)
+                px = (tb[2] - tb[0]) / w
+                py = (tb[3] - tb[1]) / h
+                vrt_path.write_text(
+                    f'<VRTDataset rasterXSize="{w}" rasterYSize="{h}">\n'
+                    f'  <SRS>{wgs84_wkt_vrt}</SRS>\n'
+                    f'  <GeoTransform>{tb[0]}, {px}, 0.0, {tb[3]}, 0.0, -{py}</GeoTransform>\n'
+                    + ''.join(
+                        f'  <VRTRasterBand dataType="Byte" band="{b}" subClass="VRTSourcedRasterBand">\n'
+                        f'    <SimpleSource>\n'
+                        f'      <SourceFilename relativeToVRT="1">{gis_png}</SourceFilename>\n'
+                        f'      <SourceBand>{b}</SourceBand>\n'
+                        f'      <SourceProperties RasterXSize="{w}" RasterYSize="{h}" DataType="Byte" BlockXSize="{w}" BlockYSize="1"/>\n'
+                        f'      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>\n'
+                        f'      <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>\n'
+                        f'    </SimpleSource>\n'
+                        f'  </VRTRasterBand>\n'
+                        for b in range(1, 5)
+                    )
+                    + '</VRTDataset>\n',
+                    encoding='utf-8'
+                )
+                vrt_paths.append(str(vrt_path))
+
+            import subprocess
+            gdalbuildvrt_exe = self._find_gdalbuildvrt()
+            if gdalbuildvrt_exe:
+                qgis_bin = Path(gdalbuildvrt_exe).parent
+                gdalwarp_exe = str(qgis_bin / 'gdalwarp.exe')
+                gdalinfo_exe = str(qgis_bin / 'gdalinfo.exe')
+                if not Path(gdalwarp_exe).exists():
+                    gdalwarp_exe = None
+            else:
+                gdalwarp_exe = None
+                gdalinfo_exe = None
+
+            if gdalbuildvrt_exe and gdalwarp_exe and vrt_paths:
+                filelist_path = gis_dir / '_tile_filelist.txt'
+                filelist_path.write_text('\n'.join(vrt_paths), encoding='utf-8')
+
+                # Step 1: WGS84 mosaic
+                wgs84_mosaic = gis_dir / 'tiles_mosaic_wgs84.vrt'
+                subprocess.run(
+                    [gdalbuildvrt_exe, '-input_file_list', str(filelist_path), str(wgs84_mosaic)],
+                    capture_output=True, text=True
+                )
+                if not wgs84_mosaic.exists():
+                    print("gdalbuildvrt failed — tiles omitted from QGS", file=sys.stderr)
+                    gdalwarp_exe = None  # skip warp step
+
+            if gdalbuildvrt_exe and gdalwarp_exe and vrt_paths:
+                # Step 2: Warp to EPSG:3857 (VRT = lazy, no pixel processing now)
+                mosaic_path = gis_dir / 'tiles_mosaic.vrt'
+                if mosaic_path.exists():
+                    mosaic_path.unlink()  # remove stale file so gdalwarp can write fresh
+                r = subprocess.run(
+                    [gdalwarp_exe, '-t_srs', 'EPSG:3857', '-r', 'bilinear',
+                     '-of', 'VRT', str(wgs84_mosaic), str(mosaic_path)],
+                    capture_output=True, text=True
+                )
+
+                if mosaic_path.exists():
+                    # Read extent from the EPSG:3857 mosaic
+                    ri = subprocess.run(
+                        [gdalinfo_exe, str(mosaic_path)],
+                        capture_output=True, text=True
+                    )
+                    # Parse corners from gdalinfo output
+                    import re
+                    m_ul = re.search(r'Upper Left\s+\(\s*([\d.]+),\s*([\d.]+)\)', ri.stdout)
+                    m_lr = re.search(r'Lower Right\s+\(\s*([\d.]+),\s*([\d.]+)\)', ri.stdout)
+                    if m_ul and m_lr:
+                        mosaic_merc_bbox = [
+                            float(m_ul.group(1)), float(m_lr.group(2)),
+                            float(m_lr.group(1)), float(m_ul.group(2))
+                        ]
+                    else:
+                        # Fallback: convert session bbox to EPSG:3857
+                        mosaic_merc_bbox = [
+                            lon_to_mercator_x(sess_min_lon), lat_to_mercator_y(sess_min_lat),
+                            lon_to_mercator_x(sess_max_lon), lat_to_mercator_y(sess_max_lat),
+                        ]
+                    print(f"Mosaic VRT (EPSG:3857) created, extent: {mosaic_merc_bbox}", file=sys.stderr)
+                    mosaic_layer_id = "dol_tiles_mosaic"
+                    ET.SubElement(layer_tree_group, 'layer-tree-layer', {
+                        'name': 'DOL Tiles',
+                        'id': mosaic_layer_id,
+                        'checked': 'Qt::Checked',
+                        'source': './tiles_mosaic.vrt',
+                        'providerKey': 'gdal',
+                        'expanded': '0'
+                    })
+                else:
+                    print(f"gdalwarp failed: {r.stderr}", file=sys.stderr)
+            else:
+                print("GDAL tools not found — tiles omitted from QGS", file=sys.stderr)
 
         # OSM at the bottom of layer tree
         ET.SubElement(layer_tree_group, 'layer-tree-layer', {
@@ -855,72 +987,29 @@ class GISProcessor:
             ET.SubElement(ml, 'featureBlendMode').text = '0'
             ET.SubElement(ml, 'layerOpacity').text = '1'
 
-        # Write GDAL PAM aux.xml for each tile in gis/ so GDAL reports EPSG:4326
-        # Without this, GDAL says "unknown CRS" and QGIS treats PGW coords as project
-        # CRS meters (102m E ≈ 0°E = ocean). With aux.xml GDAL knows they're degrees.
-        wgs84_wkt_simple = ('GEOGCS["WGS 84",DATUM["WGS_1984",'
-                            'SPHEROID["WGS 84",6378137,298.257223563]],'
-                            'PRIMEM["Greenwich",0],'
-                            'UNIT["degree",0.0174532925199433]]')
-        if gis_dir and gis_dir.exists():
-            for tile_id, gis_png, tile_bbox in tile_layer_entries:
-                aux_path = gis_dir / (gis_png + '.aux.xml')
-                if not aux_path.exists():
-                    w = 256
-                    px = (tile_bbox[2] - tile_bbox[0]) / w
-                    py = (tile_bbox[3] - tile_bbox[1]) / w
-                    ul_x = tile_bbox[0]
-                    ul_y = tile_bbox[3]
-                    aux_path.write_text(
-                        '<PAMDataset>\n'
-                        f'  <SRS>{wgs84_wkt_simple}</SRS>\n'
-                        f'  <GeoTransform>{ul_x}, {px}, 0.0, {ul_y}, 0.0, -{py}</GeoTransform>\n'
-                        '</PAMDataset>\n',
-                        encoding='utf-8'
-                    )
-
-        # Add individual tile maplayers using same relative paths as QLR (proven to work)
-        for tile_id, gis_png, tile_bbox in tile_layer_entries:
+        # Add single mosaic tile layer — EPSG:3857, extent in meters = same as project
+        if mosaic_layer_id and mosaic_merc_bbox:
             tml = ET.SubElement(map_layers, 'maplayer', {
                 'minimumScale': '0', 'maximumScale': '1e+08',
                 'type': 'raster', 'hasScaleBasedVisibilityFlag': '0',
                 'styleCategories': 'AllStyleCategories'
             })
-            ET.SubElement(tml, 'id').text = tile_id
-            ET.SubElement(tml, 'layername').text = gis_png
-            ET.SubElement(tml, 'datasource').text = f"./{gis_png}"
+            ET.SubElement(tml, 'id').text = mosaic_layer_id
+            ET.SubElement(tml, 'layername').text = 'DOL Tiles'
+            ET.SubElement(tml, 'datasource').text = './tiles_mosaic.vrt'
             ET.SubElement(tml, 'provider').text = 'gdal'
-            # Use OGC:CRS84 (Lon/Lat axis order) to match what GDAL reports from
-            # the aux.xml — EPSG:4326 would flip axes (Lat first) and misplace tiles
+            # Layer SRS = EPSG:3857 (matches file CRS after gdalwarp + project CRS)
             t_srs = ET.SubElement(tml, 'srs')
-            t_ref = ET.SubElement(t_srs, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-            ET.SubElement(t_ref, 'wkt').text = (
-                'GEOGCRS["WGS 84 (CRS84)",'
-                'DATUM["World Geodetic System 1984",'
-                'ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],'
-                'PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],'
-                'CS[ellipsoidal,2],'
-                'AXIS["geodetic longitude (Lon)",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],'
-                'AXIS["geodetic latitude (Lat)",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],'
-                'USAGE[SCOPE["Not known."],AREA["World."],BBOX[-90,-180,90,180]],'
-                'ID["OGC","CRS84"]]'
-            )
-            ET.SubElement(t_ref, 'proj4').text = '+proj=longlat +datum=WGS84 +no_defs'
-            ET.SubElement(t_ref, 'srsid').text = '3452'
-            ET.SubElement(t_ref, 'srid').text = '4326'
-            ET.SubElement(t_ref, 'authid').text = 'OGC:CRS84'
-            ET.SubElement(t_ref, 'description').text = 'WGS 84 (CRS84)'
-            ET.SubElement(t_ref, 'projectionacronym').text = 'longlat'
-            ET.SubElement(t_ref, 'ellipsoidacronym').text = 'EPSG:7030'
-            ET.SubElement(t_ref, 'geographicflag').text = 'true'
+            make_spatialrefsys(t_srs, use_proj_crs=True)
             t_ext = ET.SubElement(tml, 'extent')
-            ET.SubElement(t_ext, 'xmin').text = str(tile_bbox[0])
-            ET.SubElement(t_ext, 'ymin').text = str(tile_bbox[1])
-            ET.SubElement(t_ext, 'xmax').text = str(tile_bbox[2])
-            ET.SubElement(t_ext, 'ymax').text = str(tile_bbox[3])
+            ET.SubElement(t_ext, 'xmin').text = str(mosaic_merc_bbox[0])
+            ET.SubElement(t_ext, 'ymin').text = str(mosaic_merc_bbox[1])
+            ET.SubElement(t_ext, 'xmax').text = str(mosaic_merc_bbox[2])
+            ET.SubElement(t_ext, 'ymax').text = str(mosaic_merc_bbox[3])
             t_pipe = ET.SubElement(tml, 'pipe')
             ET.SubElement(t_pipe, 'rasterrenderer', {
-                'type': 'singlebandcolordata', 'opacity': '1', 'alphaBand': '-1', 'band': '1'
+                'type': 'multibandcolor', 'opacity': '1',
+                'redBand': '1', 'greenBand': '2', 'blueBand': '3', 'alphaBand': '4'
             })
             ET.SubElement(tml, 'blendMode').text = '0'
 
