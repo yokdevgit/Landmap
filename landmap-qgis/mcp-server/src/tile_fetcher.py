@@ -407,45 +407,40 @@ class TileFetcher:
             steps_x, steps_y = self._calculate_grid_steps(padded_bbox)
             found_data = False
 
-            # A point far outside the bbox (0.5 degrees north) used to despawn tiles on retries
+            # A point far outside the bbox (0.5 degrees north) used to despawn tiles
             far_away_lat = max_lat_padded + 0.5
             far_away_lon = center_lon
 
-            TOTAL_PASSES = 3
-            cells_with_tiles: set[tuple[int, int]] = set()
+            ALTITUDE = 1500   # metres — single zoom level, consistent tile resolution
+            TOTAL_PASSES = 3  # retry passes within this session for uncovered grid cells
 
-            log(f"Searching for parcel data in {steps_x}x{steps_y} grid ({steps_x * steps_y} positions) with 10% padding, up to {TOTAL_PASSES} passes...")
+            cells_with_tiles: set[tuple[int, int]] = set()
+            total_cells = steps_x * steps_y
+            log(f"Grid: {steps_x}x{steps_y} = {total_cells} cells, 10% padding, up to {TOTAL_PASSES} passes")
 
             for scan_pass in range(TOTAL_PASSES):
-                tiles_at_pass_start = len(self.tiles)
-
                 cells_to_scan = [
                     (row, col)
                     for row in range(steps_y)
                     for col in range(steps_x)
                     if (row, col) not in cells_with_tiles
                 ]
-
                 if not cells_to_scan:
-                    log(f"\nAll cells covered — stopping after pass {scan_pass}")
+                    log(f"All {total_cells} cells covered — done")
                     break
 
-                log(f"\n{'='*50}")
-                log(f"PASS {scan_pass + 1}/{TOTAL_PASSES} — {len(cells_to_scan)} cells to scan")
-                log(f"{'='*50}")
+                tiles_at_pass_start = len(self.tiles)
+                log(f"\nPass {scan_pass + 1}/{TOTAL_PASSES} — {len(cells_to_scan)} cells")
 
                 for row, col in cells_to_scan:
                     target_lat = min_lat_padded + (lat_range * (row + 0.5) / steps_y)
                     target_lon = min_lon_padded + (lon_range * (col + 0.5) / steps_x)
 
-                    log(f"\n=== Pass {scan_pass + 1} | Cell ({col+1},{row+1}) of ({steps_x},{steps_y}): {target_lat:.4f}, {target_lon:.4f} ===")
-
+                    log(f"\n  Pass {scan_pass+1} | Cell ({col+1},{row+1}): {target_lat:.4f}, {target_lon:.4f}")
                     tiles_before_cell = len(self.tiles)
 
-                    # On retry passes: fly far away first (same altitude = parcel layer stays active)
-                    # to fully despawn tiles, then fly back for a clean reload
+                    # Despawn on retry passes so browser requests fresh tiles
                     if scan_pass > 0:
-                        log(f"  Flying far away to despawn tiles...")
                         await page.evaluate(f"""
                             () => {{
                                 if (typeof viewer !== 'undefined' && viewer.camera) {{
@@ -460,12 +455,11 @@ class TileFetcher:
                         """)
                         await asyncio.sleep(2)
 
-                    # Navigate to target cell
                     await page.evaluate(f"""
                         () => {{
                             if (typeof viewer !== 'undefined' && viewer.camera) {{
                                 viewer.camera.flyTo({{
-                                    destination: Cesium.Cartesian3.fromDegrees({target_lon}, {target_lat}, 1500),
+                                    destination: Cesium.Cartesian3.fromDegrees({target_lon}, {target_lat}, {ALTITUDE}),
                                     duration: 1
                                 }});
                             }} else if (typeof map !== 'undefined' && map.setView) {{
@@ -478,31 +472,26 @@ class TileFetcher:
                     if not found_data:
                         if await self._try_double_click_with_offsets(page, canvas_box):
                             found_data = True
-                            log("Parcel layer activated! Continuing to pan and capture tiles...")
+                            log("Parcel layer activated! Continuing scan...")
 
-                    # Wait for tiles to load
                     await asyncio.sleep(3)
 
-                    if len(self.tiles) > tiles_before_cell:
+                    new_count = len(self.tiles) - tiles_before_cell
+                    if new_count > 0:
                         cells_with_tiles.add((row, col))
-                        log(f"  Cell ({col+1},{row+1}): {len(self.tiles) - tiles_before_cell} new tiles")
-                    else:
-                        log(f"  Cell ({col+1},{row+1}): 0 tiles — will retry next pass")
-
-                    log(f"  Total tiles: {len(self.tiles)}")
+                    log(f"  Cell ({col+1},{row+1}): +{new_count} tiles | total: {len(self.tiles)} | covered: {len(cells_with_tiles)}/{total_cells}")
 
                     if len(self.tiles) >= self.MAX_TILES_PER_SESSION:
                         log(f"Reached max tiles ({self.MAX_TILES_PER_SESSION})")
                         break
 
                 new_tiles = len(self.tiles) - tiles_at_pass_start
-                log(f"\nPass {scan_pass + 1} done: {new_tiles} new tiles, {len(cells_with_tiles)}/{steps_x * steps_y} cells covered")
+                log(f"\nPass {scan_pass + 1} done: +{new_tiles} tiles, {len(cells_with_tiles)}/{total_cells} cells covered")
 
                 if len(self.tiles) >= self.MAX_TILES_PER_SESSION:
                     break
-
                 if scan_pass > 0 and new_tiles == 0:
-                    log("No new tiles in this pass — stopping early")
+                    log("No new tiles this pass — stopping")
                     break
 
             if not found_data:
@@ -525,10 +514,265 @@ class TileFetcher:
             await browser.close()
             await playwright.stop()
 
+        # Retry empty tiles in fresh browser sessions (up to 3 rounds)
+        if found_data:
+            await self._retry_empty_tiles(output_path, session_name, bbox, location_info, zoom_level)
+
         return {
             "tile_count": len(self.tiles),
             "output_path": str(output_path)
         }
+
+    async def _is_tile_empty(self, png_path: Path) -> bool:
+        """Return True if the tile PNG is fully transparent (alpha=0 everywhere)."""
+        try:
+            from PIL import Image
+            img = Image.open(png_path)
+            if img.mode == 'RGBA':
+                _, _, _, a = img.split()
+                return max(a.getdata()) == 0
+        except Exception:
+            pass
+        return False
+
+    async def _retry_empty_tiles(
+        self,
+        output_path: Path,
+        session_name: str,
+        bbox: list[float],
+        location_info: dict,
+        zoom_level: int = 17,
+    ) -> int:
+        """
+        After the main scan, open fresh browser sessions to re-fetch transparent tiles.
+        Repeats until no empty tiles remain or 3 rounds with no improvement.
+        """
+        images_dir = output_path / "images"
+        total_replaced = 0
+        MAX_ROUNDS = 3
+
+        for round_num in range(1, MAX_ROUNDS + 1):
+            empty = [
+                (i, t) for i, t in enumerate(self.tiles)
+                if await self._is_tile_empty(images_dir / f"tile_{i}.png")
+            ]
+            if not empty:
+                if round_num == 1:
+                    log("\nNo empty tiles — no retry needed.")
+                else:
+                    log(f"\nAll empty tiles filled after {round_num - 1} retry round(s).")
+                break
+
+            log(f"\n{'='*55}")
+            log(f"EMPTY TILE RETRY {round_num}/{MAX_ROUNDS}: {len(empty)} transparent tiles")
+            log(f"{'='*55}")
+
+            replaced = await self._run_retry_session(empty, images_dir, bbox, zoom_level)
+            total_replaced += replaced
+            log(f"Retry round {round_num}: replaced {replaced}/{len(empty)} tiles")
+
+            if replaced == 0:
+                log("No improvement — remaining empty tiles likely have no parcel data here.")
+                break
+
+        if total_replaced > 0:
+            await self._save_session(output_path, session_name, bbox, location_info)
+
+        return total_replaced
+
+    async def _run_retry_session(
+        self,
+        empty_tiles: list[tuple[int, dict]],
+        images_dir: Path,
+        bbox: list[float],
+        zoom_level: int = 17,
+    ) -> int:
+        """
+        Open a fresh browser and run the same systematic grid scan as the main fetch.
+        Only overwrites tiles that are currently empty (fully transparent).
+        Returns count of tiles replaced.
+        """
+        # Register empty tile bboxes as pending replacements
+        pending: dict[str, int] = {}   # url_key -> tile_idx
+        for tile_idx, tile in empty_tiles:
+            bbox_str = ','.join(str(v) for v in tile['bbox'])
+            layers = tile.get('layers', '')
+            url_key = f"{bbox_str}_{layers}"
+            self.captured_urls.discard(url_key)  # allow re-interception
+            pending[url_key] = tile_idx
+
+        replaced_count = [0]
+
+        # Recompute padded bbox + grid — identical to main scan
+        min_lon, min_lat, max_lon, max_lat = bbox
+        lat_range_raw = max_lat - min_lat
+        lon_range_raw = max_lon - min_lon
+        min_lon_padded = min_lon - lon_range_raw * 0.10
+        max_lon_padded = max_lon + lon_range_raw * 0.10
+        min_lat_padded = min_lat - lat_range_raw * 0.10
+        max_lat_padded = max_lat + lat_range_raw * 0.10
+        center_lon = (min_lon + max_lon) / 2
+
+        padded_bbox = [min_lon_padded, min_lat_padded, max_lon_padded, max_lat_padded]
+        steps_x, steps_y = self._calculate_grid_steps(padded_bbox)
+        lat_range = max_lat_padded - min_lat_padded
+        lon_range = max_lon_padded - min_lon_padded
+        far_away_lat = max_lat_padded + 0.5
+        ALTITUDE = 1500
+        TOTAL_PASSES = 3
+
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=False,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='th-TH'
+        )
+        log("Retry: fresh incognito browser — running same grid scan")
+        page = await context.new_page()
+
+        async def capture_retry(response):
+            url = response.url
+            if 'geoserver' not in url.lower():
+                return
+            if 'GetMap' not in url and 'wms' not in url.lower():
+                return
+            if response.status != 200:
+                return
+            try:
+                if 'image' not in response.headers.get('content-type', ''):
+                    return
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query)
+                bbox_str = params.get('BBOX', params.get('bbox', ['']))[0]
+                if not bbox_str:
+                    return
+                layers = params.get('LAYERS', params.get('layers', ['']))[0]
+                url_key = f"{bbox_str}_{layers}"
+                if url_key not in pending:
+                    return
+
+                body = await response.body()
+                if len(body) < 500:
+                    return
+
+                # Only overwrite if the new tile is non-transparent
+                from PIL import Image as _PIL
+                import io as _io
+                img = _PIL.open(_io.BytesIO(body))
+                if img.mode == 'RGBA':
+                    _, _, _, a = img.split()
+                    if max(a.getdata()) == 0:
+                        return  # Still empty — don't overwrite
+
+                tile_idx = pending.pop(url_key)
+                self.captured_urls.add(url_key)
+                png_path = images_dir / f"tile_{tile_idx}.png"
+                with open(png_path, 'wb') as f:
+                    f.write(body)
+                self.tiles[tile_idx]['size'] = len(body)
+                replaced_count[0] += 1
+                log(f"  Replaced tile_{tile_idx}.png: {len(body)}b")
+            except Exception:
+                pass
+
+        page.on('response', capture_retry)
+
+        try:
+            log("Retry: opening DOL website...")
+            await page.goto(self.DOL_URL, timeout=120000)
+            await asyncio.sleep(10)
+
+            # Navigate to area center first
+            await page.evaluate(f"""
+                () => {{
+                    if (typeof viewer !== 'undefined' && viewer.camera) {{
+                        viewer.camera.flyTo({{
+                            destination: Cesium.Cartesian3.fromDegrees({center_lon}, {(min_lat + max_lat) / 2}, 2000),
+                            duration: 2
+                        }});
+                    }}
+                }}
+            """)
+            await asyncio.sleep(5)
+
+            canvas = await page.query_selector('canvas')
+            canvas_box = await canvas.bounding_box() if canvas else None
+            found_data = False
+            cells_with_tiles: set[tuple[int, int]] = set()
+
+            # Same grid scan as main fetch — identical cell order, timing, despawn logic
+            for scan_pass in range(TOTAL_PASSES):
+                if not pending:
+                    log("  All empty tiles filled — stopping retry scan")
+                    break
+
+                cells_to_scan = [
+                    (row, col)
+                    for row in range(steps_y)
+                    for col in range(steps_x)
+                    if (row, col) not in cells_with_tiles
+                ]
+                if not cells_to_scan:
+                    break
+
+                replaced_at_pass_start = replaced_count[0]
+                log(f"\n  Retry pass {scan_pass + 1}/{TOTAL_PASSES} — {len(cells_to_scan)} cells, {len(pending)} tiles still pending")
+
+                for row, col in cells_to_scan:
+                    if not pending:
+                        break
+                    target_lat = min_lat_padded + (lat_range * (row + 0.5) / steps_y)
+                    target_lon = min_lon_padded + (lon_range * (col + 0.5) / steps_x)
+
+                    if scan_pass > 0:
+                        await page.evaluate(f"""
+                            () => {{
+                                if (typeof viewer !== 'undefined' && viewer.camera) {{
+                                    viewer.camera.flyTo({{
+                                        destination: Cesium.Cartesian3.fromDegrees({center_lon}, {far_away_lat}, 1500),
+                                        duration: 1
+                                    }});
+                                }}
+                            }}
+                        """)
+                        await asyncio.sleep(2)
+
+                    await page.evaluate(f"""
+                        () => {{
+                            if (typeof viewer !== 'undefined' && viewer.camera) {{
+                                viewer.camera.flyTo({{
+                                    destination: Cesium.Cartesian3.fromDegrees({target_lon}, {target_lat}, {ALTITUDE}),
+                                    duration: 1
+                                }});
+                            }}
+                        }}
+                    """)
+                    await asyncio.sleep(3)
+
+                    if not found_data and canvas_box:
+                        if await self._try_double_click_with_offsets(page, canvas_box):
+                            found_data = True
+
+                    await asyncio.sleep(3)
+                    cells_with_tiles.add((row, col))
+
+                new_replaced = replaced_count[0] - replaced_at_pass_start
+                log(f"  Retry pass {scan_pass + 1} done: +{new_replaced} replaced, {len(pending)} still pending")
+                if scan_pass > 0 and new_replaced == 0:
+                    log("  No improvement this pass — stopping")
+                    break
+
+        except Exception as e:
+            log(f"Retry session error: {e}")
+        finally:
+            await browser.close()
+            await playwright.stop()
+
+        return replaced_count[0]
 
     async def _fetch_wfs_features(self, page, utmmaps: set[str], features_dir: Path, utmmap_layers: dict[str, str] = None):
         """

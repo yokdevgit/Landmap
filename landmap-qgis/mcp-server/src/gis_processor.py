@@ -779,24 +779,49 @@ class GISProcessor:
                     t['bbox'][3] <= sess_max_lat + pad)
             ]
 
-            # Find dominant pixel size (most common zoom level) and filter to ±20%
+            # Compute pixel sizes, filter out background/basemap outliers, then sort
+            # coarsest-first so fine tiles composite on top (gdalbuildvrt last-source wins).
             from collections import Counter
-            px_sizes = [round((t['bbox'][2]-t['bbox'][0]) / t.get('width', 256), 10)
-                        for t in candidate_tiles]
-            dominant_px = Counter(px_sizes).most_common(1)[0][0] if px_sizes else None
+            raw_px = [(t['bbox'][2]-t['bbox'][0]) / t.get('width', 256) for t in candidate_tiles]
+            dominant_px = Counter(round(p, 10) for p in raw_px).most_common(1)[0][0] if raw_px else None
+
+            # Keep only tiles within 8x of dominant (≤3 zoom levels away in either direction).
+            # This excludes Cesium background tiles (zoom 0-12) that span huge areas and would
+            # inflate the mosaic raster to billions of pixels when forced to the finest resolution.
             if dominant_px:
-                valid_tiles = [
-                    t for t, px in zip(candidate_tiles, px_sizes)
-                    if abs(px - dominant_px) <= dominant_px * 0.2
-                ]
+                valid_pairs = [(px, t) for px, t in zip(raw_px, candidate_tiles)
+                               if dominant_px / 8 <= px <= dominant_px * 8]
             else:
-                valid_tiles = candidate_tiles
-            print(f"Building mosaic: {len(valid_tiles)} tiles at px={dominant_px:.8f} deg/px "
-                  f"(filtered from {len(tiles)} total)", file=sys.stderr)
+                valid_pairs = list(zip(raw_px, candidate_tiles))
+
+            # Sort descending by pixel size (coarsest first) so fine tiles overwrite gaps
+            valid_pairs.sort(key=lambda x: x[0], reverse=True)
+            px_sizes = [p[0] for p in valid_pairs]
+            valid_tiles = [p[1] for p in valid_pairs]
+
+            print(f"Mosaic: {len(valid_tiles)}/{len(candidate_tiles)} tiles after zoom filter "
+                  f"(dominant={dominant_px:.8f} deg/px)", file=sys.stderr)
 
             vrt_paths = []
+            skipped_transparent = 0
             for tile in valid_tiles:
                 gis_png = Path(tile['fileName']).name
+                png_path = gis_dir / gis_png
+                # Skip fully-transparent tiles — they would win over useful coarse tiles
+                # in gdalbuildvrt (last-source-wins) but contribute no visible content.
+                if png_path.exists():
+                    try:
+                        from PIL import Image as _PIL
+                        _img = _PIL.open(png_path)
+                        if _img.mode == 'RGBA':
+                            import struct as _struct
+                            # Fast check: read only the alpha channel max
+                            _r, _g, _b, _a = _img.split()
+                            if max(_a.getdata()) == 0:
+                                skipped_transparent += 1
+                                continue
+                    except Exception:
+                        pass  # If PIL fails, include the tile anyway
                 vrt_name = gis_png.replace('.png', '.vrt')
                 vrt_path = gis_dir / vrt_name
                 tb = tile['bbox']
@@ -825,6 +850,8 @@ class GISProcessor:
                 )
                 vrt_paths.append(str(vrt_path))
 
+            print(f"VRT list: {len(vrt_paths)} tiles included, {skipped_transparent} fully-transparent skipped",
+                  file=sys.stderr)
             import subprocess
             gdalbuildvrt_exe = self._find_gdalbuildvrt()
             if gdalbuildvrt_exe:
@@ -841,12 +868,15 @@ class GISProcessor:
                 filelist_path = gis_dir / '_tile_filelist.txt'
                 filelist_path.write_text('\n'.join(vrt_paths), encoding='utf-8')
 
-                # Step 1: WGS84 mosaic
+                # Step 1: WGS84 mosaic — force output to dominant pixel size so the mosaic
+                # stays at a manageable resolution. Coarser gap-fill tiles get upsampled
+                # at most 8x; finer tiles contribute at dominant resolution (slight downsample).
                 wgs84_mosaic = gis_dir / 'tiles_mosaic_wgs84.vrt'
-                subprocess.run(
-                    [gdalbuildvrt_exe, '-input_file_list', str(filelist_path), str(wgs84_mosaic)],
-                    capture_output=True, text=True
-                )
+                vrt_cmd = [gdalbuildvrt_exe]
+                if dominant_px:
+                    vrt_cmd += ['-tr', str(dominant_px), str(dominant_px)]
+                vrt_cmd += ['-input_file_list', str(filelist_path), str(wgs84_mosaic)]
+                subprocess.run(vrt_cmd, capture_output=True, text=True)
                 if not wgs84_mosaic.exists():
                     print("gdalbuildvrt failed — tiles omitted from QGS", file=sys.stderr)
                     gdalwarp_exe = None  # skip warp step
@@ -923,8 +953,8 @@ class GISProcessor:
             except Exception as e:
                 print(f"Warning: could not read CRS from {shp_path}: {e}", file=sys.stderr)
 
-        def add_outline_renderer(parent, outline_color, width):
-            """Add a SimpleFill renderer with outline only (no fill)."""
+        def add_outline_renderer(parent, outline_color, width, fill_color="0,0,0,0"):
+            """Add a SimpleFill renderer with a solid style (fill + outline)."""
             renderer = ET.SubElement(parent, 'renderer-v2', {
                 'type': 'singleSymbol',
                 'symbollevels': '0',
@@ -941,7 +971,7 @@ class GISProcessor:
             })
             for k, v in [
                 ('border_width_map_unit_scale', '3x:0,0,0,0,0,0'),
-                ('color', '0,0,0,0'),           # transparent fill
+                ('color', fill_color),
                 ('joinstyle', 'miter'),
                 ('offset', '0,0'),
                 ('offset_map_unit_scale', '3x:0,0,0,0,0,0'),
@@ -950,16 +980,16 @@ class GISProcessor:
                 ('outline_style', 'solid'),
                 ('outline_width', width),
                 ('outline_width_unit', 'MM'),
-                ('style', 'no'),                # no fill
+                ('style', 'solid'),
             ]:
                 ET.SubElement(layer_el, 'prop', {'k': k, 'v': v})
             ET.SubElement(renderer, 'rotation')
             ET.SubElement(renderer, 'sizescale')
 
-        # Styling: parcel = red outline, boundary = blue outline
+        # Styling: parcel = red outline (transparent fill), boundary = blue semi-transparent fill + outline
         layer_styles = {
-            "parcel_dol": ("255,0,0,255", "0.5"),
-            "boundary":   ("0,0,255,255", "1.0"),
+            "parcel_dol": ("255,0,0,255", "0.5", "0,0,0,0"),
+            "boundary":   ("0,0,255,255", "1.0", "65,105,225,30"),  # royal blue, 12% opacity fill
         }
 
         # Add vector maplayers
@@ -981,8 +1011,8 @@ class GISProcessor:
             # Include actual CRS from shapefile so QGIS reprojects correctly
             make_layer_srs(ml, shp_path)
             ET.SubElement(ml, 'provider', {'encoding': 'UTF-8'}).text = 'ogr'
-            outline_color, width = layer_styles.get(layer_id, ("128,128,128,255", "0.5"))
-            add_outline_renderer(ml, outline_color, width)
+            outline_color, width, fill_color = layer_styles.get(layer_id, ("128,128,128,255", "0.5", "0,0,0,0"))
+            add_outline_renderer(ml, outline_color, width, fill_color)
             ET.SubElement(ml, 'blendMode').text = '0'
             ET.SubElement(ml, 'featureBlendMode').text = '0'
             ET.SubElement(ml, 'layerOpacity').text = '1'
