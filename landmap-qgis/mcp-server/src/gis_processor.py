@@ -523,6 +523,7 @@ class GISProcessor:
                     import sys; print(f"Saved {parcel_count} parcel features", file=sys.stderr)
 
         # 2. Boundary shapefile from our shapefile database
+        boundary_gdf = None
         if location_info:
             try:
                 province = location_info.get("province")
@@ -547,6 +548,16 @@ class GISProcessor:
         gis_dir = session_dir / "gis"
         if not gis_dir.exists():
             await self.process_session(session_name)
+
+        # Write boundary as GeoJSON to gis/ so the QGS can use it via relative path.
+        # GeoJSON avoids DBF encoding issues with Thai text that can break the OGR provider
+        # in QGIS when reading the .shp version.
+        if boundary_gdf is not None and not boundary_gdf.empty:
+            try:
+                geojson_str = boundary_gdf.to_json()
+                (gis_dir / "boundary.geojson").write_text(geojson_str, encoding='utf-8')
+            except Exception as e:
+                import sys; print(f"Error writing boundary GeoJSON: {e}", file=sys.stderr)
 
         # 5. QGIS project file — placed in gis/ so relative tile paths work
         try:
@@ -605,158 +616,323 @@ class GISProcessor:
         print(f"Saved grid mapsheet list to {csv_path}", file=sys.stderr)
 
     def _generate_qgs_project(self, qgs_path: Path, session_name: str, data_dir: Path, layers: dict, bbox: list = None, tiles: list = None, session_dir: Path = None, gis_dir: Path = None):
-        """Generate a QGIS project file (.qgs) with proper CRS and canvas extent."""
-        import sys
+        """Generate a QGIS 3.40-compatible project file (.qgs)."""
+        import sys, math, uuid
 
-        import math
-
-        # Use EPSG:3857 (Web Mercator) as project CRS — same as OSM basemap,
-        # same as what users have when they load the QLR into an existing session.
-        # This ensures QGIS correctly reprojects WGS84 raster tiles for display.
-        crs_wkt = (
-            'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
-            'ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],'
+        # WKT2 strings shared across the file
+        wgs84_ensemble_wkt = (
+            'GEOGCRS["WGS 84",ENSEMBLE["World Geodetic System 1984 ensemble",'
+            'MEMBER["World Geodetic System 1984 (Transit)"],'
+            'MEMBER["World Geodetic System 1984 (G730)"],'
+            'MEMBER["World Geodetic System 1984 (G873)"],'
+            'MEMBER["World Geodetic System 1984 (G1150)"],'
+            'MEMBER["World Geodetic System 1984 (G1674)"],'
+            'MEMBER["World Geodetic System 1984 (G1762)"],'
+            'MEMBER["World Geodetic System 1984 (G2139)"],'
+            'MEMBER["World Geodetic System 1984 (G2296)"],'
+            'ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]],'
+            'ENSEMBLEACCURACY[2.0]],'
             'PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],'
             'CS[ellipsoidal,2],'
             'AXIS["geodetic latitude (Lat)",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],'
             'AXIS["geodetic longitude (Lon)",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],'
+            'USAGE[SCOPE["Horizontal component of 3D system."],AREA["World."],BBOX[-90,-180,90,180]],'
             'ID["EPSG",4326]]'
         )
-        crs_proj4 = '+proj=longlat +datum=WGS84 +no_defs'
-        proj_crs_wkt = (
+        merc_wkt = (
             'PROJCRS["WGS 84 / Pseudo-Mercator",BASEGEOGCRS["WGS 84",'
             'DATUM["World Geodetic System 1984",'
             'ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],'
-            'PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],'
-            'CONVERSION["Popular Visualisation Pseudo-Mercator",'
-            'METHOD["Popular Visualisation Pseudo Mercator",ID["EPSG",1024]],'
-            'PARAMETER["Longitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],'
-            'PARAMETER["False easting",0,LENGTHUNIT["metre",1],ID["EPSG",8806]],'
-            'PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],'
+            'PRIMEM["Greenwich",0]],CONVERSION["Popular Visualisation Pseudo-Mercator",'
+            'METHOD["Popular Visualisation Pseudo Mercator",ID["EPSG",1024]]],'
             'CS[Cartesian,2],AXIS["easting (X)",east,ORDER[1],LENGTHUNIT["metre",1]],'
             'AXIS["northing (Y)",north,ORDER[2],LENGTHUNIT["metre",1]],'
-            'USAGE[SCOPE["Web mapping and visualisation."],'
-            'AREA["World between 85.06 S and 85.06 N."],BBOX[-85.06,-180,85.06,180]],'
             'ID["EPSG",3857]]'
         )
 
-        def make_spatialrefsys(parent, use_proj_crs=True):
-            """Write EPSG:3857 (project) or EPSG:4326 (tile/layer) SRS element."""
+        def make_wgs84_srs(parent):
             ref = ET.SubElement(parent, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-            if use_proj_crs:
-                ET.SubElement(ref, 'wkt').text = proj_crs_wkt
-                ET.SubElement(ref, 'proj4').text = '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs'
-                ET.SubElement(ref, 'srsid').text = '3857'
-                ET.SubElement(ref, 'srid').text = '3857'
-                ET.SubElement(ref, 'authid').text = 'EPSG:3857'
-                ET.SubElement(ref, 'description').text = 'WGS 84 / Pseudo-Mercator'
-                ET.SubElement(ref, 'projectionacronym').text = 'merc'
-                ET.SubElement(ref, 'ellipsoidacronym').text = 'EPSG:7030'
-                ET.SubElement(ref, 'geographicflag').text = 'false'
-            else:
-                ET.SubElement(ref, 'wkt').text = crs_wkt
-                ET.SubElement(ref, 'proj4').text = crs_proj4
-                ET.SubElement(ref, 'srsid').text = '3452'
-                ET.SubElement(ref, 'srid').text = '4326'
-                ET.SubElement(ref, 'authid').text = 'EPSG:4326'
-                ET.SubElement(ref, 'description').text = 'WGS 84'
-                ET.SubElement(ref, 'projectionacronym').text = 'longlat'
-                ET.SubElement(ref, 'ellipsoidacronym').text = 'EPSG:7030'
-                ET.SubElement(ref, 'geographicflag').text = 'true'
+            ET.SubElement(ref, 'wkt').text = wgs84_ensemble_wkt
+            ET.SubElement(ref, 'proj4').text = '+proj=longlat +datum=WGS84 +no_defs'
+            ET.SubElement(ref, 'srsid').text = '3452'
+            ET.SubElement(ref, 'srid').text = '4326'
+            ET.SubElement(ref, 'authid').text = 'EPSG:4326'
+            ET.SubElement(ref, 'description').text = 'WGS 84'
+            ET.SubElement(ref, 'projectionacronym').text = 'longlat'
+            ET.SubElement(ref, 'ellipsoidacronym').text = 'EPSG:7030'
+            ET.SubElement(ref, 'geographicflag').text = 'true'
+
+        def make_merc_srs(parent):
+            ref = ET.SubElement(parent, 'spatialrefsys', {'nativeFormat': 'Wkt'})
+            ET.SubElement(ref, 'wkt').text = merc_wkt
+            ET.SubElement(ref, 'proj4').text = '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +no_defs'
+            ET.SubElement(ref, 'srsid').text = '3857'
+            ET.SubElement(ref, 'srid').text = '3857'
+            ET.SubElement(ref, 'authid').text = 'EPSG:3857'
+            ET.SubElement(ref, 'description').text = 'WGS 84 / Pseudo-Mercator'
+            ET.SubElement(ref, 'projectionacronym').text = 'merc'
+            ET.SubElement(ref, 'ellipsoidacronym').text = 'EPSG:7030'
+            ET.SubElement(ref, 'geographicflag').text = 'false'
 
         def lon_to_mercator_x(lon):
             return lon * 20037508.342789244 / 180.0
 
         def lat_to_mercator_y(lat):
-            lat_rad = math.radians(lat)
-            return math.log(math.tan(math.pi / 4 + lat_rad / 2)) * 6378137.0
+            return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * 6378137.0
 
-        # Canvas extent in EPSG:3857 meters
-        canvas_bounds = None
+        # Canvas extent in EPSG:3857 meters (project CRS = EPSG:3857 to match tiles/OSM,
+        # avoids CRS axis-order ambiguity that arises with EPSG:4326 as project CRS
+        # when mixing projected EPSG:3857 raster layers with geographic EPSG:4326 vectors).
+        canvas_bounds_merc = None
         if bbox and len(bbox) == 4:
             min_lon, min_lat, max_lon, max_lat = bbox
             pad_lon = (max_lon - min_lon) * 0.15
             pad_lat = (max_lat - min_lat) * 0.15
-            canvas_bounds = (
+            canvas_bounds_merc = (
                 lon_to_mercator_x(min_lon - pad_lon),
                 lat_to_mercator_y(min_lat - pad_lat),
                 lon_to_mercator_x(max_lon + pad_lon),
                 lat_to_mercator_y(max_lat + pad_lat),
             )
-
         parcel_shp = data_dir / "parcel_dol.shp"
         boundary_shp = data_dir / "boundary.shp"
+        boundary_geojson = (gis_dir / "boundary.geojson") if gis_dir else None
 
-        # Build .qgs XML
-        home_dir = str((gis_dir if gis_dir else data_dir).resolve()).replace('\\', '/')
-        qgs = ET.Element('qgis', {'projectname': session_name, 'version': '3.22.0'})
-        ET.SubElement(qgs, 'homePath', {'path': home_dir})
+        # Assign UUID-format layer IDs matching QGIS 3.40 native format
+        def make_layer_id(name):
+            return f"{name}_{uuid.uuid4().hex[:8]}_{uuid.uuid4().hex[:4]}_{uuid.uuid4().hex[:4]}_{uuid.uuid4().hex[:4]}_{uuid.uuid4().hex[:12]}"
 
-        # Project CRS = EPSG:3857
-        proj_crs_el = ET.SubElement(qgs, 'projectCrs')
-        make_spatialrefsys(proj_crs_el, use_proj_crs=True)
+        # Vector layers: reproject to EPSG:3857 so they match the project CRS —
+        # same approach used for DOL tiles (gdalwarp to EPSG:3857).
+        # Without this, QGIS treats EPSG:4326 degree values as EPSG:3857 meters
+        # and places features near (0°N, 0°E) = middle of ocean.
+        def _reproject_to_3857(src_path: Path, out_path: Path):
+            gdf = gpd.read_file(str(src_path))
+            gdf.to_crs("EPSG:3857").to_file(str(out_path), driver='GeoJSON')
 
-        # Layer tree
-        layer_tree_group = ET.SubElement(qgs, 'layer-tree-group')
-        ET.SubElement(layer_tree_group, 'custom-order', {'enabled': '0'})
-
-        # Map canvas in EPSG:3857
-        mapcanvas = ET.SubElement(qgs, 'mapcanvas', {
-            'name': 'theMapCanvas',
-            'annotationsVisible': '1'
-        })
-        ET.SubElement(mapcanvas, 'units').text = 'meters'
-        if canvas_bounds:
-            ext_el = ET.SubElement(mapcanvas, 'extent')
-            ET.SubElement(ext_el, 'xmin').text = str(canvas_bounds[0])
-            ET.SubElement(ext_el, 'ymin').text = str(canvas_bounds[1])
-            ET.SubElement(ext_el, 'xmax').text = str(canvas_bounds[2])
-            ET.SubElement(ext_el, 'ymax').text = str(canvas_bounds[3])
-        ET.SubElement(mapcanvas, 'rotation').text = '0'
-        dest_srs = ET.SubElement(mapcanvas, 'destinationsrs')
-        make_spatialrefsys(dest_srs, use_proj_crs=True)
-
-        # Project layers
-        map_layers = ET.SubElement(qgs, 'projectlayers')
-
-        # Vector layers (parcel on top, boundary below)
         vector_layers = []
-        if parcel_shp.exists():
-            vector_layers.append(("parcel_dol", "Parcel (DOL)", "parcel_dol.shp"))
-        if boundary_shp.exists():
-            vector_layers.append(("boundary", "Boundary", "boundary.shp"))
+        if parcel_shp.exists() and gis_dir:
+            lid = make_layer_id("parcel_dol")
+            p3857 = gis_dir / "parcel_dol_3857.geojson"
+            try:
+                _reproject_to_3857(parcel_shp, p3857)
+                vector_layers.append({"id": lid, "name": "Parcel (DOL)", "src": "./parcel_dol_3857.geojson", "style": "parcel_dol", "checked": "Qt::Unchecked"})
+            except Exception as e:
+                print(f"Parcel reproject failed: {e}", file=sys.stderr)
+        if boundary_geojson and boundary_geojson.exists() and gis_dir:
+            lid = make_layer_id("boundary")
+            b3857 = gis_dir / "boundary_3857.geojson"
+            try:
+                _reproject_to_3857(boundary_geojson, b3857)
+                vector_layers.append({"id": lid, "name": "Boundary", "src": "./boundary_3857.geojson", "style": "boundary"})
+            except Exception as e:
+                print(f"Boundary reproject failed: {e}", file=sys.stderr)
+        elif boundary_shp.exists() and gis_dir:
+            lid = make_layer_id("boundary")
+            b3857 = gis_dir / "boundary_3857.geojson"
+            try:
+                _reproject_to_3857(boundary_shp, b3857)
+                vector_layers.append({"id": lid, "name": "Boundary", "src": "./boundary_3857.geojson", "style": "boundary"})
+            except Exception as e:
+                print(f"Boundary reproject failed: {e}", file=sys.stderr)
 
-        # OSM basemap (bottom of stack)
-        osm_id = "OpenStreetMap_basemap"
+        osm_id = make_layer_id("OpenStreetMap")
         osm_datasource = (
             "crs=EPSG:3857&format&type=xyz"
             "&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png"
             "&zmax=19&zmin=0"
         )
-        osm_crs_wkt = (
-            'PROJCRS["WGS 84 / Pseudo-Mercator",'
-            'BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
-            'ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],'
-            'PRIMEM["Greenwich",0],CS[ellipsoidal,2],'
-            'AXIS["latitude",north],AXIS["longitude",east],'
-            'ID["EPSG",4326]],'
-            'CONVERSION["Popular Visualisation Pseudo-Mercator",'
-            'METHOD["Popular Visualisation Pseudo Mercator",ID["EPSG",1024]]],'
-            'CS[Cartesian,2],AXIS["(E)",east],AXIS["(N)",north],'
-            'LENGTHUNIT["metre",1],ID["EPSG",3857]]'
-        )
 
-        # Add vector layers to tree (parcel, boundary)
-        for layer_id, layer_name, filename in vector_layers:
-            abs_shp = str((data_dir / filename).resolve()).replace('\\', '/')
-            ET.SubElement(layer_tree_group, 'layer-tree-layer', {
-                'name': layer_name,
-                'id': layer_id,
-                'checked': 'Qt::Checked',
-                'source': abs_shp,
-                'providerKey': 'ogr',
-                'expanded': '1'
+        # ── Build QGS XML ──────────────────────────────────────────────────────
+        home_dir = str((gis_dir if gis_dir else data_dir).resolve()).replace('\\', '/')
+        qgs = ET.Element('qgis', {
+            'projectname': session_name,
+            'version': '3.40.15-Bratislava',
+            'saveDateTime': '2026-01-01T00:00:00',
+        })
+        ET.SubElement(qgs, 'homePath', {'path': ''})
+        ET.SubElement(qgs, 'title').text = session_name
+        ET.SubElement(qgs, 'transaction', {'mode': 'Disabled'})
+        ET.SubElement(qgs, 'projectFlags', {'set': ''})
+
+        proj_crs_el = ET.SubElement(qgs, 'projectCrs')
+        make_merc_srs(proj_crs_el)
+
+        # Vertical CRS (empty, required by QGIS 3.40)
+        vcrs_el = ET.SubElement(qgs, 'verticalCrs')
+        vcrs_ref = ET.SubElement(vcrs_el, 'spatialrefsys', {'nativeFormat': 'Wkt'})
+        for tag, val in [('wkt',''),('proj4',''),('srsid','0'),('srid','0'),('authid',''),
+                         ('description',''),('projectionacronym',''),('ellipsoidacronym',''),('geographicflag','false')]:
+            ET.SubElement(vcrs_ref, tag).text = val
+
+        ET.SubElement(qgs, 'elevation-shading-renderer', {
+            'hillshading-z-factor': '1', 'hillshading-is-multidirectional': '0',
+            'combined-method': '0', 'hillshading-is-active': '0',
+            'edl-distance-unit': '0', 'is-active': '0', 'light-altitude': '45',
+            'edl-is-active': '1', 'light-azimuth': '315', 'edl-strength': '1000', 'edl-distance': '0.5'
+        })
+
+        # Layer tree group
+        layer_tree_group = ET.SubElement(qgs, 'layer-tree-group')
+        ltg_custom = ET.SubElement(layer_tree_group, 'customproperties')
+        ET.SubElement(ltg_custom, 'Option')
+
+        def add_tree_layer(parent, layer_info, provider, source=None):
+            src = source if source else layer_info.get('src', '')
+            el = ET.SubElement(parent, 'layer-tree-layer', {
+                'name': layer_info['name'],
+                'source': src,
+                'legend_exp': '',
+                'legend_split_behavior': '0',
+                'providerKey': provider,
+                'expanded': '1',
+                'id': layer_info['id'],
+                'checked': layer_info.get('checked', 'Qt::Checked'),
+                'patch_size': '-1,-1',
             })
+            cp = ET.SubElement(el, 'customproperties')
+            ET.SubElement(cp, 'Option')
+            return el
+
+        for vl in vector_layers:
+            add_tree_layer(layer_tree_group, vl, 'ogr')
+
+        # Snapping settings (required for QGIS 3.40, minimal)
+        snap = ET.SubElement(qgs, 'snapping-settings', {
+            'tolerance': '12', 'enabled': '0', 'scaleDependencyMode': '0',
+            'intersection-snapping': '0', 'maxScale': '0', 'unit': '1',
+            'mode': '2', 'type': '1', 'self-snapping': '0', 'minScale': '0'
+        })
+        snap_ind = ET.SubElement(snap, 'individual-layer-settings')
+        for vl in vector_layers:
+            ET.SubElement(snap_ind, 'layer-setting', {
+                'tolerance': '12', 'enabled': '0', 'units': '1',
+                'maxScale': '0', 'id': vl['id'], 'type': '1', 'minScale': '0'
+            })
+        ET.SubElement(qgs, 'relations')
+
+        # Map canvas — EPSG:3857 in meters
+        mapcanvas = ET.SubElement(qgs, 'mapcanvas', {'name': 'theMapCanvas', 'annotationsVisible': '1'})
+        ET.SubElement(mapcanvas, 'units').text = 'meters'
+        if canvas_bounds_merc:
+            ext_el = ET.SubElement(mapcanvas, 'extent')
+            ET.SubElement(ext_el, 'xmin').text = str(canvas_bounds_merc[0])
+            ET.SubElement(ext_el, 'ymin').text = str(canvas_bounds_merc[1])
+            ET.SubElement(ext_el, 'xmax').text = str(canvas_bounds_merc[2])
+            ET.SubElement(ext_el, 'ymax').text = str(canvas_bounds_merc[3])
+        ET.SubElement(mapcanvas, 'rotation').text = '0'
+        dest_srs = ET.SubElement(mapcanvas, 'destinationsrs')
+        make_merc_srs(dest_srs)
+        ET.SubElement(mapcanvas, 'rendermaptile').text = '0'
+
+        ET.SubElement(qgs, 'projectModels')
+
+        # Legend (required by QGIS 3.40 to properly display layers)
+        legend_el = ET.SubElement(qgs, 'legend', {'updateDrawingOrder': 'true'})
+        for vl in vector_layers:
+            ll = ET.SubElement(legend_el, 'legendlayer', {
+                'name': vl['name'], 'showFeatureCount': '0',
+                'drawingOrder': '-1', 'open': 'true', 'checked': 'Qt::Checked'
+            })
+            fg = ET.SubElement(ll, 'filegroup', {'open': 'true', 'hidden': 'false'})
+            ET.SubElement(fg, 'legendlayerfile', {'visible': '1', 'isInOverview': '0', 'layerid': vl['id']})
+
+        ET.SubElement(qgs, 'mapViewDocks')
+
+        # Project layers
+        map_layers = ET.SubElement(qgs, 'projectlayers')
+
+        layer_styles = {
+            "parcel_dol": ("255,0,0,255", "0.5", "0,0,0,0"),
+            "boundary":   ("0,0,255,255", "1.5", "65,105,225,60"),
+        }
+
+        def add_outline_renderer(parent, outline_color, width, fill_color="0,0,0,0"):
+            renderer = ET.SubElement(parent, 'renderer-v2', {
+                'type': 'singleSymbol', 'symbollevels': '0',
+                'enableorderby': '0', 'forceraster': '0'
+            })
+            symbols = ET.SubElement(renderer, 'symbols')
+            symbol = ET.SubElement(symbols, 'symbol', {
+                'type': 'fill', 'name': '0', 'alpha': '1',
+                'clip_to_extent': '1', 'force_rhr': '0'
+            })
+            layer_el = ET.SubElement(symbol, 'layer', {
+                'pass': '0', 'class': 'SimpleFill', 'locked': '0', 'enabled': '1'
+            })
+            for k, v in [
+                ('border_width_map_unit_scale', '3x:0,0,0,0,0,0'),
+                ('color', fill_color), ('joinstyle', 'miter'),
+                ('offset', '0,0'), ('offset_map_unit_scale', '3x:0,0,0,0,0,0'),
+                ('offset_unit', 'MM'), ('outline_color', outline_color),
+                ('outline_style', 'solid'), ('outline_width', width),
+                ('outline_width_unit', 'MM'), ('style', 'solid'),
+            ]:
+                ET.SubElement(layer_el, 'prop', {'k': k, 'v': v})
+            ET.SubElement(renderer, 'rotation')
+            ET.SubElement(renderer, 'sizescale')
+
+        # Vector maplayers with full QGIS 3.40 attributes
+        for vl in vector_layers:
+            # Get full bounds from shapefile/geojson metadata (fast, no feature scan)
+            xmin, ymin, xmax, ymax = 0.0, 0.0, 0.0, 0.0
+            try:
+                if vl['src'].endswith('.geojson') or vl['src'].startswith('./'):
+                    src_path = gis_dir / Path(vl['src']).name if gis_dir else Path(vl['src'])
+                else:
+                    src_path = Path(vl['src'])
+                from pyogrio import read_info as _read_info
+                _info = _read_info(str(src_path))
+                b = _info['total_bounds']  # (minx, miny, maxx, maxy)
+                xmin, ymin, xmax, ymax = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            except Exception:
+                if bbox and len(bbox) == 4:
+                    xmin, ymin, xmax, ymax = bbox
+
+            ml = ET.SubElement(map_layers, 'maplayer', {
+                'labelsEnabled': '0',
+                'hasScaleBasedVisibilityFlag': '0',
+                'simplifyDrawingHints': '1',
+                'simplifyMaxScale': '1',
+                'styleCategories': 'AllStyleCategories',
+                'maxScale': '0',
+                'autoRefreshMode': 'Disabled',
+                'legendPlaceholderImage': '',
+                'simplifyLocal': '1',
+                'simplifyDrawingTol': '1',
+                'type': 'vector',
+                'refreshOnNotifyMessage': '',
+                'minScale': '100000000',
+                'wkbType': 'MultiPolygon',
+                'symbologyReferenceScale': '-1',
+                'readOnly': '0',
+                'autoRefreshTime': '0',
+                'simplifyAlgorithm': '0',
+                'refreshOnNotifyEnabled': '0',
+                'geometry': 'Polygon',
+            })
+            ext_ml = ET.SubElement(ml, 'extent')
+            ET.SubElement(ext_ml, 'xmin').text = str(xmin)
+            ET.SubElement(ext_ml, 'ymin').text = str(ymin)
+            ET.SubElement(ext_ml, 'xmax').text = str(xmax)
+            ET.SubElement(ext_ml, 'ymax').text = str(ymax)
+            wgs_ml = ET.SubElement(ml, 'wgs84extent')
+            ET.SubElement(wgs_ml, 'xmin').text = str(xmin)
+            ET.SubElement(wgs_ml, 'ymin').text = str(ymin)
+            ET.SubElement(wgs_ml, 'xmax').text = str(xmax)
+            ET.SubElement(wgs_ml, 'ymax').text = str(ymax)
+            ET.SubElement(ml, 'id').text = vl['id']
+            ET.SubElement(ml, 'datasource').text = vl['src']
+            kw = ET.SubElement(ml, 'keywordList'); ET.SubElement(kw, 'value').text = ''
+            ET.SubElement(ml, 'layername').text = vl['name']
+            srs_el = ET.SubElement(ml, 'srs'); make_merc_srs(srs_el)
+            ET.SubElement(ml, 'provider', {'encoding': 'UTF-8'}).text = 'ogr'
+            ET.SubElement(ml, 'layerGeometryType').text = '2'
+            outline_color, width, fill_color = layer_styles.get(vl['style'], ("128,128,128,255", "0.5", "0,0,0,0"))
+            add_outline_renderer(ml, outline_color, width, fill_color)
+            ET.SubElement(ml, 'blendMode').text = '0'
+            ET.SubElement(ml, 'featureBlendMode').text = '0'
+            ET.SubElement(ml, 'layerOpacity').text = '1'
 
         # Raster tiles: write per-tile VRTs → WGS84 mosaic → warp to EPSG:3857.
         # Filtering to the dominant pixel size avoids gdalbuildvrt picking the
@@ -914,123 +1090,54 @@ class GISProcessor:
                             lon_to_mercator_x(sess_max_lon), lat_to_mercator_y(sess_max_lat),
                         ]
                     print(f"Mosaic VRT (EPSG:3857) created, extent: {mosaic_merc_bbox}", file=sys.stderr)
-                    mosaic_layer_id = "dol_tiles_mosaic"
-                    ET.SubElement(layer_tree_group, 'layer-tree-layer', {
+                    mosaic_layer_id = make_layer_id("DOL_Tiles")
+                    mosaic_tree = ET.SubElement(layer_tree_group, 'layer-tree-layer', {
                         'name': 'DOL Tiles',
                         'id': mosaic_layer_id,
                         'checked': 'Qt::Checked',
                         'source': './tiles_mosaic.vrt',
                         'providerKey': 'gdal',
-                        'expanded': '0'
+                        'expanded': '0',
+                        'legend_exp': '',
+                        'legend_split_behavior': '0',
+                        'patch_size': '-1,-1',
                     })
+                    cp = ET.SubElement(mosaic_tree, 'customproperties')
+                    ET.SubElement(cp, 'Option')
                 else:
                     print(f"gdalwarp failed: {r.stderr}", file=sys.stderr)
             else:
                 print("GDAL tools not found — tiles omitted from QGS", file=sys.stderr)
 
         # OSM at the bottom of layer tree
-        ET.SubElement(layer_tree_group, 'layer-tree-layer', {
+        osm_tree = ET.SubElement(layer_tree_group, 'layer-tree-layer', {
             'name': 'OpenStreetMap',
             'id': osm_id,
             'checked': 'Qt::Checked',
             'source': osm_datasource,
-            'providerKey': 'wms'
+            'providerKey': 'wms',
+            'expanded': '0',
+            'legend_exp': '',
+            'legend_split_behavior': '0',
+            'patch_size': '-1,-1',
         })
+        osm_tree_cp = ET.SubElement(osm_tree, 'customproperties')
+        ET.SubElement(osm_tree_cp, 'Option')
 
-        def make_layer_srs(parent, shp_path: Path):
-            """Read CRS from shapefile and write <srs> element."""
-            try:
-                gdf = gpd.read_file(shp_path, rows=1)
-                crs = gdf.crs
-                if crs:
-                    layer_srs = ET.SubElement(parent, 'srs')
-                    ref = ET.SubElement(layer_srs, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-                    ET.SubElement(ref, 'wkt').text = crs.to_wkt()
-                    ET.SubElement(ref, 'proj4').text = crs.to_proj4()
-                    ET.SubElement(ref, 'authid').text = crs.to_authority(min_confidence=20)[0] + ':' + crs.to_authority(min_confidence=20)[1] if crs.to_authority(min_confidence=20) else str(crs)
-                    ET.SubElement(ref, 'description').text = crs.name
-                    ET.SubElement(ref, 'geographicflag').text = 'true' if crs.is_geographic else 'false'
-            except Exception as e:
-                print(f"Warning: could not read CRS from {shp_path}: {e}", file=sys.stderr)
-
-        def add_outline_renderer(parent, outline_color, width, fill_color="0,0,0,0"):
-            """Add a SimpleFill renderer with a solid style (fill + outline)."""
-            renderer = ET.SubElement(parent, 'renderer-v2', {
-                'type': 'singleSymbol',
-                'symbollevels': '0',
-                'enableorderby': '0',
-                'forceraster': '0'
-            })
-            symbols = ET.SubElement(renderer, 'symbols')
-            symbol = ET.SubElement(symbols, 'symbol', {
-                'type': 'fill', 'name': '0', 'alpha': '1',
-                'clip_to_extent': '1', 'force_rhr': '0'
-            })
-            layer_el = ET.SubElement(symbol, 'layer', {
-                'pass': '0', 'class': 'SimpleFill', 'locked': '0', 'enabled': '1'
-            })
-            for k, v in [
-                ('border_width_map_unit_scale', '3x:0,0,0,0,0,0'),
-                ('color', fill_color),
-                ('joinstyle', 'miter'),
-                ('offset', '0,0'),
-                ('offset_map_unit_scale', '3x:0,0,0,0,0,0'),
-                ('offset_unit', 'MM'),
-                ('outline_color', outline_color),
-                ('outline_style', 'solid'),
-                ('outline_width', width),
-                ('outline_width_unit', 'MM'),
-                ('style', 'solid'),
-            ]:
-                ET.SubElement(layer_el, 'prop', {'k': k, 'v': v})
-            ET.SubElement(renderer, 'rotation')
-            ET.SubElement(renderer, 'sizescale')
-
-        # Styling: parcel = red outline (transparent fill), boundary = blue semi-transparent fill + outline
-        layer_styles = {
-            "parcel_dol": ("255,0,0,255", "0.5", "0,0,0,0"),
-            "boundary":   ("0,0,255,255", "1.0", "65,105,225,30"),  # royal blue, 12% opacity fill
-        }
-
-        # Add vector maplayers
-        for layer_id, layer_name, filename in vector_layers:
-            shp_path = data_dir / filename
-            ml = ET.SubElement(map_layers, 'maplayer', {
-                'type': 'vector',
-                'autoRefreshEnabled': '0',
-                'geometry': 'Polygon',
-                'hasScaleBasedVisibilityFlag': '0',
-                'styleCategories': 'AllStyleCategories'
-            })
-            ET.SubElement(ml, 'id').text = layer_id
-            # Use absolute path so QGIS finds the file regardless of working dir
-            ET.SubElement(ml, 'datasource').text = str(shp_path.resolve()).replace('\\', '/')
-            kw = ET.SubElement(ml, 'keywordList')
-            ET.SubElement(kw, 'value')
-            ET.SubElement(ml, 'layername').text = layer_name
-            # Include actual CRS from shapefile so QGIS reprojects correctly
-            make_layer_srs(ml, shp_path)
-            ET.SubElement(ml, 'provider', {'encoding': 'UTF-8'}).text = 'ogr'
-            outline_color, width, fill_color = layer_styles.get(layer_id, ("128,128,128,255", "0.5", "0,0,0,0"))
-            add_outline_renderer(ml, outline_color, width, fill_color)
-            ET.SubElement(ml, 'blendMode').text = '0'
-            ET.SubElement(ml, 'featureBlendMode').text = '0'
-            ET.SubElement(ml, 'layerOpacity').text = '1'
-
-        # Add single mosaic tile layer — EPSG:3857, extent in meters = same as project
+        # Add mosaic tile maplayer — EPSG:3857, extent in meters
         if mosaic_layer_id and mosaic_merc_bbox:
             tml = ET.SubElement(map_layers, 'maplayer', {
-                'minimumScale': '0', 'maximumScale': '1e+08',
-                'type': 'raster', 'hasScaleBasedVisibilityFlag': '0',
-                'styleCategories': 'AllStyleCategories'
+                'type': 'raster',
+                'autoRefreshMode': 'Disabled',
+                'hasScaleBasedVisibilityFlag': '0',
+                'styleCategories': 'AllStyleCategories',
             })
             ET.SubElement(tml, 'id').text = mosaic_layer_id
             ET.SubElement(tml, 'layername').text = 'DOL Tiles'
             ET.SubElement(tml, 'datasource').text = './tiles_mosaic.vrt'
             ET.SubElement(tml, 'provider').text = 'gdal'
-            # Layer SRS = EPSG:3857 (matches file CRS after gdalwarp + project CRS)
             t_srs = ET.SubElement(tml, 'srs')
-            make_spatialrefsys(t_srs, use_proj_crs=True)
+            make_merc_srs(t_srs)
             t_ext = ET.SubElement(tml, 'extent')
             ET.SubElement(t_ext, 'xmin').text = str(mosaic_merc_bbox[0])
             ET.SubElement(t_ext, 'ymin').text = str(mosaic_merc_bbox[1])
@@ -1046,23 +1153,26 @@ class GISProcessor:
         # Add OSM maplayer
         osm_ml = ET.SubElement(map_layers, 'maplayer', {
             'type': 'raster',
-            'autoRefreshEnabled': '0',
-            'hasScaleBasedVisibilityFlag': '0'
+            'autoRefreshMode': 'Disabled',
+            'hasScaleBasedVisibilityFlag': '0',
+            'styleCategories': 'AllStyleCategories',
         })
         ET.SubElement(osm_ml, 'id').text = osm_id
         ET.SubElement(osm_ml, 'layername').text = 'OpenStreetMap'
         ET.SubElement(osm_ml, 'datasource').text = osm_datasource
         ET.SubElement(osm_ml, 'provider', {'encoding': ''}).text = 'wms'
         osm_srs_el = ET.SubElement(osm_ml, 'srs')
-        osm_ref = ET.SubElement(osm_srs_el, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-        ET.SubElement(osm_ref, 'wkt').text = osm_crs_wkt
-        ET.SubElement(osm_ref, 'proj4').text = '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs'
-        ET.SubElement(osm_ref, 'authid').text = 'EPSG:3857'
-        ET.SubElement(osm_ref, 'description').text = 'WGS 84 / Pseudo-Mercator'
-        ET.SubElement(osm_ref, 'projectionacronym').text = 'merc'
-        ET.SubElement(osm_ref, 'geographicflag').text = 'false'
+        make_merc_srs(osm_srs_el)
+        ET.SubElement(osm_ml, 'blendMode').text = '0'
 
+        # Write file with DOCTYPE declaration (required by QGIS 3.40 to load layers)
         tree = ET.ElementTree(qgs)
         ET.indent(tree, space='  ')
-        with open(qgs_path, 'wb') as f:
-            tree.write(f, encoding='utf-8', xml_declaration=True)
+        import io as _io
+        buf = _io.BytesIO()
+        tree.write(buf, encoding='utf-8', xml_declaration=True)
+        xml_bytes = buf.getvalue()
+        doctype = b"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>\n"
+        decl_end = xml_bytes.index(b'?>') + 2
+        xml_bytes = xml_bytes[:decl_end] + b'\n' + doctype + xml_bytes[decl_end:]
+        qgs_path.write_bytes(xml_bytes)
