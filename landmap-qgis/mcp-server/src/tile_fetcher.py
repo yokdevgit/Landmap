@@ -22,6 +22,14 @@ from urllib.parse import parse_qs, urlparse, unquote
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 
+from .tile_quality import (
+    is_blank_tile,
+    is_overview_tile,
+    refetch_blank_tiles,
+    load_parcel_bboxes,
+    bbox_overlaps_any,
+)
+
 
 def log(msg: str):
     """Log to stderr so we don't break MCP JSON-RPC on stdout."""
@@ -101,13 +109,16 @@ class TileFetcher:
             log(f"Error checking popup: {e}")
             return None
 
-    async def _try_double_click_with_offsets(self, page, canvas_box: dict) -> bool:
+    async def _try_double_click_with_offsets(self, page, canvas_box: dict) -> tuple[bool, bool]:
         """
         Try double-clicking at different positions within the current view.
 
         Tries: center, left 25%, right 25%, top 25%, bottom 25%
 
-        Returns True if data found at any position.
+        Returns (found_data, saw_no_data):
+          found_data  - True if any position returned the "รับทราบ" (has data) popup.
+          saw_no_data - True if any position returned the explicit "ตกลง" (no data)
+                        popup, i.e. DOL confirmed there is no parcel here.
         """
         center_x = canvas_box['x'] + canvas_box['width'] / 2
         center_y = canvas_box['y'] + canvas_box['height'] / 2
@@ -123,6 +134,7 @@ class TileFetcher:
             ("bottom 25%", center_x, center_y + offset_y),
         ]
 
+        saw_no_data = False
         for name, x, y in positions:
             log(f"  Trying {name} ({x:.0f}, {y:.0f})...")
 
@@ -133,15 +145,16 @@ class TileFetcher:
 
             if has_data is True:
                 log(f"  >>> FOUND DATA at {name}!")
-                return True
+                return (True, saw_no_data)
             elif has_data is False:
+                saw_no_data = True
                 log(f"  >>> No data at {name}, trying next position...")
                 continue
             else:
                 log(f"  >>> No popup at {name}, trying next position...")
                 continue
 
-        return False
+        return (False, saw_no_data)
 
     def _calculate_grid_steps(self, bbox: list[float]) -> tuple[int, int]:
         """
@@ -262,6 +275,13 @@ class TileFetcher:
 
                         bbox_parts = [float(x) for x in bbox_str.split(',')]
 
+                        # Drop Cesium overview tiles requested mid-flight: the
+                        # parcel layer is below its min render scale when zoomed
+                        # out, so these are always transparent junk that no retry
+                        # can fill (see tile_quality.is_overview_tile).
+                        if is_overview_tile(bbox_parts):
+                            return
+
                         # Create unique key for deduplication
                         url_key = f"{bbox_str}_{params.get('LAYERS', params.get('layers', ['']))[0]}"
                         if url_key in self.captured_urls:
@@ -357,6 +377,20 @@ class TileFetcher:
 
             await asyncio.sleep(3)
 
+            # DOL sits behind an Incapsula challenge (~15-25s, variable) before
+            # Cesium initialises. Fixed sleeps race it and intermittently miss the
+            # canvas ("No canvas found" -> 0 tiles). Wait on the actual condition.
+            log("Waiting for Cesium viewer to be ready...")
+            try:
+                await page.wait_for_selector('canvas', timeout=60000)
+                await page.wait_for_function(
+                    "() => typeof viewer !== 'undefined' && viewer && viewer.camera",
+                    timeout=60000,
+                )
+                log("Cesium viewer ready.")
+            except Exception:
+                log("WARNING: viewer not confirmed ready within 60s; continuing anyway.")
+
             # Navigate to target location using Cesium
             log(f"Navigating to center: {center_lat}, {center_lon}")
 
@@ -415,6 +449,9 @@ class TileFetcher:
             TOTAL_PASSES = 3  # retry passes within this session for uncovered grid cells
 
             cells_with_tiles: set[tuple[int, int]] = set()
+            # Cells where DOL explicitly reported "no parcel here" (ตกลง) and no
+            # tiles came in — genuinely empty, so don't waste later passes on them.
+            no_data_cells: set[tuple[int, int]] = set()
             total_cells = steps_x * steps_y
             log(f"Grid: {steps_x}x{steps_y} = {total_cells} cells, 10% padding, up to {TOTAL_PASSES} passes")
 
@@ -424,6 +461,7 @@ class TileFetcher:
                     for row in range(steps_y)
                     for col in range(steps_x)
                     if (row, col) not in cells_with_tiles
+                    and (row, col) not in no_data_cells
                 ]
                 if not cells_to_scan:
                     log(f"All {total_cells} cells covered — done")
@@ -469,8 +507,10 @@ class TileFetcher:
                     """)
                     await asyncio.sleep(3)
 
+                    saw_no_data = False
                     if not found_data:
-                        if await self._try_double_click_with_offsets(page, canvas_box):
+                        found, saw_no_data = await self._try_double_click_with_offsets(page, canvas_box)
+                        if found:
                             found_data = True
                             log("Parcel layer activated! Continuing scan...")
 
@@ -479,6 +519,10 @@ class TileFetcher:
                     new_count = len(self.tiles) - tiles_before_cell
                     if new_count > 0:
                         cells_with_tiles.add((row, col))
+                    elif saw_no_data:
+                        # DOL confirmed no parcel here and nothing loaded — skip re-scan.
+                        no_data_cells.add((row, col))
+                        log(f"  Cell ({col+1},{row+1}): DOL reports no parcel data — won't re-scan")
                     log(f"  Cell ({col+1},{row+1}): +{new_count} tiles | total: {len(self.tiles)} | covered: {len(cells_with_tiles)}/{total_cells}")
 
                     if len(self.tiles) >= self.MAX_TILES_PER_SESSION:
@@ -505,6 +549,40 @@ class TileFetcher:
                     log(f"\nFetching WFS vector data for {len(self.captured_utmmaps)} utmmap(s)...")
                     await self._fetch_wfs_features(page, self.captured_utmmaps, features_dir, self.utmmap_layers)
 
+            # Stop intercepting first: the live Cesium map keeps requesting tiles
+            # and the re-fetch responses below would otherwise be re-captured as
+            # brand-new tiles, growing self.tiles without end.
+            page.remove_listener('response', capture_tile)
+
+            # Ground truth for "is there a parcel line here?" from the WFS data,
+            # so we never retry blank tiles over genuinely empty land (river/road
+            # = 'no line'); those would only ever come back blank.
+            features_dir = output_path / "features"
+            parcel_boxes = (load_parcel_bboxes(sorted(features_dir.glob("*.geojson")))
+                            if features_dir.exists() else [])
+            has_data = (lambda b: bbox_overlaps_any(b, parcel_boxes)) if parcel_boxes else None
+
+            # Primary blank recovery: re-GET each blank tile's exact URL while the
+            # session is still live. A blank tile over a parcel is almost always a
+            # transient empty GeoServer render (proven: same bbox returns parcels
+            # on retry), so a direct re-fetch recovers it far more reliably than
+            # re-flying the camera. The camera re-scan below is a fallback.
+            blank_all = [i for i in range(len(self.tiles))
+                         if is_blank_tile(images_dir / f"tile_{i}.png")]
+            blank_idx = [i for i in blank_all
+                         if has_data is None or not self.tiles[i].get('bbox')
+                         or has_data(self.tiles[i]['bbox'])]
+            no_data_blanks = len(blank_all) - len(blank_idx)
+            if blank_idx:
+                log(f"\nDirect re-fetch: {len(blank_idx)} recoverable blank tile(s) via "
+                    f"stored URLs ({no_data_blanks} no-parcel blanks left as-is)...")
+                fetch_url = self._make_url_fetcher(page)
+                filled = await refetch_blank_tiles(
+                    self.tiles, images_dir, fetch_url, has_data=has_data)
+                log(f"Direct re-fetch filled {filled}/{len(blank_idx)} blank tile(s)")
+            elif no_data_blanks:
+                log(f"\n{no_data_blanks} blank tile(s) are over no-parcel land — no retry needed.")
+
         except Exception as e:
             log(f"Error: {e}")
         finally:
@@ -523,17 +601,32 @@ class TileFetcher:
             "output_path": str(output_path)
         }
 
+    def _make_url_fetcher(self, page):
+        """Return an async fetch_url(url) -> bytes|None that GETs a WMS tile from
+        inside the live page, reusing the DOL session cookies (same technique as
+        the WFS fetch). Used by refetch_blank_tiles to recover blank tiles."""
+        async def fetch_url(url: str):
+            try:
+                b64 = await page.evaluate(
+                    """async (u) => {
+                        const r = await fetch(u, { credentials: 'include' });
+                        if (!r.ok) return null;
+                        const buf = new Uint8Array(await r.arrayBuffer());
+                        let bin = '';
+                        for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+                        return btoa(bin);
+                    }""",
+                    url,
+                )
+                return base64.b64decode(b64) if b64 else None
+            except Exception:
+                return None
+        return fetch_url
+
     async def _is_tile_empty(self, png_path: Path) -> bool:
-        """Return True if the tile PNG is fully transparent (alpha=0 everywhere)."""
-        try:
-            from PIL import Image
-            img = Image.open(png_path)
-            if img.mode == 'RGBA':
-                _, _, _, a = img.split()
-                return max(a.getdata()) == 0
-        except Exception:
-            pass
-        return False
+        """Return True if the tile PNG carries essentially no visible content
+        (fully transparent OR near-empty). Shared detector — see tile_quality."""
+        return is_blank_tile(png_path)
 
     async def _retry_empty_tiles(
         self,
@@ -548,13 +641,23 @@ class TileFetcher:
         Repeats until no empty tiles remain or 3 rounds with no improvement.
         """
         images_dir = output_path / "images"
+        features_dir = output_path / "features"
         total_replaced = 0
         MAX_ROUNDS = 3
+
+        # Only chase blank tiles that actually have a parcel under them; blanks
+        # over no-parcel land ('no line') are genuinely empty — don't re-scan.
+        parcel_boxes = (load_parcel_bboxes(sorted(features_dir.glob("*.geojson")))
+                        if features_dir.exists() else [])
+
+        def _has_parcel(t):
+            b = t.get('bbox')
+            return (not parcel_boxes) or (not b) or bbox_overlaps_any(b, parcel_boxes)
 
         for round_num in range(1, MAX_ROUNDS + 1):
             empty = [
                 (i, t) for i, t in enumerate(self.tiles)
-                if await self._is_tile_empty(images_dir / f"tile_{i}.png")
+                if _has_parcel(t) and await self._is_tile_empty(images_dir / f"tile_{i}.png")
             ]
             if not empty:
                 if round_num == 1:
@@ -659,14 +762,9 @@ class TileFetcher:
                 if len(body) < 500:
                     return
 
-                # Only overwrite if the new tile is non-transparent
-                from PIL import Image as _PIL
-                import io as _io
-                img = _PIL.open(_io.BytesIO(body))
-                if img.mode == 'RGBA':
-                    _, _, _, a = img.split()
-                    if max(a.getdata()) == 0:
-                        return  # Still empty — don't overwrite
+                # Only overwrite if the new tile actually has content
+                if is_blank_tile(body):
+                    return  # Still blank — don't overwrite
 
                 tile_idx = pending.pop(url_key)
                 self.captured_urls.add(url_key)
@@ -685,6 +783,14 @@ class TileFetcher:
             log("Retry: opening DOL website...")
             await page.goto(self.DOL_URL, timeout=120000)
             await asyncio.sleep(10)
+            try:
+                await page.wait_for_selector('canvas', timeout=60000)
+                await page.wait_for_function(
+                    "() => typeof viewer !== 'undefined' && viewer && viewer.camera",
+                    timeout=60000,
+                )
+            except Exception:
+                pass
 
             # Navigate to area center first
             await page.evaluate(f"""
@@ -754,7 +860,8 @@ class TileFetcher:
                     await asyncio.sleep(3)
 
                     if not found_data and canvas_box:
-                        if await self._try_double_click_with_offsets(page, canvas_box):
+                        found, _ = await self._try_double_click_with_offsets(page, canvas_box)
+                        if found:
                             found_data = True
 
                     await asyncio.sleep(3)

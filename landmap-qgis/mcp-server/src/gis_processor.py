@@ -27,6 +27,7 @@ except ImportError:
 
 # Import boundary service for actual geometry
 from .boundary_service import BoundaryService
+from .tile_quality import is_blank_tile
 
 # Initialize boundary service
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -154,6 +155,11 @@ class GISProcessor:
             # Get source image path
             source_path = session_dir / tile["fileName"]
             if not source_path.exists():
+                return None
+
+            # Skip blank tiles (fully transparent OR near-empty) so they don't
+            # emit a PNG + world file and clutter the legacy QLR output.
+            if is_blank_tile(source_path):
                 return None
 
             # Get tile info
@@ -986,21 +992,13 @@ class GISProcessor:
             for tile in valid_tiles:
                 gis_png = Path(tile['fileName']).name
                 png_path = gis_dir / gis_png
-                # Skip fully-transparent tiles — they would win over useful coarse tiles
-                # in gdalbuildvrt (last-source-wins) but contribute no visible content.
-                if png_path.exists():
-                    try:
-                        from PIL import Image as _PIL
-                        _img = _PIL.open(png_path)
-                        if _img.mode == 'RGBA':
-                            import struct as _struct
-                            # Fast check: read only the alpha channel max
-                            _r, _g, _b, _a = _img.split()
-                            if max(_a.getdata()) == 0:
-                                skipped_transparent += 1
-                                continue
-                    except Exception:
-                        pass  # If PIL fails, include the tile anyway
+                # Skip tiles that are missing (blanks are no longer copied into
+                # gis/ by _process_tile) or blank (fully transparent OR near-empty).
+                # As fine tiles, blanks would win over useful coarse tiles in
+                # gdalbuildvrt (last-source-wins) and punch holes in the mosaic.
+                if not png_path.exists() or is_blank_tile(png_path):
+                    skipped_transparent += 1
+                    continue
                 vrt_name = gis_png.replace('.png', '.vrt')
                 vrt_path = gis_dir / vrt_name
                 tb = tile['bbox']
