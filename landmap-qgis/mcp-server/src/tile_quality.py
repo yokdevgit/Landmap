@@ -201,6 +201,40 @@ def wfs_getfeature_url(wfs_base, type_name, utmmap, bbox, epsg, max_features=500
     )
 
 
+_ROMAN = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5, 'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10}
+
+
+def label_to_utmmap(indlabel):
+    """Convert a 1:4000 map-sheet index label to the utmmap id V_PARCEL needs.
+
+    Format is "<utm1> <ROMAN section> <number>" (e.g. '5136 III 6418'); the utmmap
+    is utm1 + the section as a digit + number -> '513636418'. Verified against live
+    DOL for 4 sheets. Returns None if the label doesn't parse. This is what lets us
+    discover the map sheet from the WFS grid layer with NO double-click.
+    """
+    parts = (indlabel or "").split()
+    if len(parts) != 3:
+        return None
+    utm1, roman, number = parts
+    section = _ROMAN.get(roman.upper())
+    if section is None or not utm1.isdigit() or not number.isdigit():
+        return None
+    return f"{utm1}{section}{number}"
+
+
+def wfs_index_url(wfs_base, zone, bbox, max_features=50):
+    """WFS GetFeature URL for the 1:4000 map-sheet grid (V_INDEX4000_<zone>_LANDNO)
+    over bbox, in the native CRS — used to discover the map sheet(s) click-free."""
+    epsg = 24047 if zone == 47 else 24048
+    e0, n0, e1, n1 = bbox_to_native(bbox, epsg)
+    return (
+        f"{wfs_base}?service=WFS&version=1.0.0&request=GetFeature"
+        f"&typeName=LANDSMAPS:V_INDEX4000_{zone}_LANDNO"
+        f"&outputFormat=application/json&maxFeatures={max_features}"
+        f"&BBOX={e0},{n0},{e1},{n1},EPSG:{epsg}"
+    )
+
+
 def parse_wms_utmmap(url):
     """Extract (utmmap, layer) from a DOL WMS tile URL, or (None, None)."""
     import re

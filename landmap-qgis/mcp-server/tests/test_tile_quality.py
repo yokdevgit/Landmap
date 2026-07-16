@@ -32,6 +32,8 @@ from src.tile_quality import (
     ACTIVATION_ANCHORS,
     wfs_getfeature_url,
     parse_wms_utmmap,
+    wfs_index_url,
+    label_to_utmmap,
 )
 
 
@@ -334,6 +336,31 @@ def test_parse_wms_utmmap():
 
 def test_parse_wms_utmmap_missing():
     assert parse_wms_utmmap("https://x/wms?service=WMS&request=GetMap") == (None, None)
+
+
+# ---------- map-sheet grid -> utmmap (click-free discovery) ----------
+def test_label_to_utmmap():
+    # utmmap = utm1 + roman-section-digit + number — verified vs live DOL for all 4.
+    assert label_to_utmmap("5136 III 6418") == "513636418"
+    assert label_to_utmmap("5036 II 4816") == "503624816"
+    assert label_to_utmmap("5438 IV 9060") == "543849060"
+    assert label_to_utmmap("4746 I 9676") == "474619676"
+
+
+def test_label_to_utmmap_bad():
+    assert label_to_utmmap("garbage") is None
+    assert label_to_utmmap("5136 Z 6418") is None   # unknown roman section
+    assert label_to_utmmap("") is None
+
+
+def test_wfs_index_url():
+    u = wfs_index_url("https://x/wfs", 47, [98.9775, 18.781, 98.9934, 18.7896])
+    assert "typeName=LANDSMAPS:V_INDEX4000_47_LANDNO" in u
+    assert "EPSG:24047" in u
+    assert "&BBOX=498" in u
+    # zone 48 picks the 48 grid + CRS
+    u48 = wfs_index_url("https://x/wfs", 48, [104.8, 15.2, 104.9, 15.3])
+    assert "V_INDEX4000_48_LANDNO" in u48 and "EPSG:24048" in u48
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):

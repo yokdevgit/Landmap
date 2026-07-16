@@ -37,6 +37,8 @@ from .tile_quality import (
     activation_anchor,
     wfs_getfeature_url,
     parse_wms_utmmap,
+    wfs_index_url,
+    label_to_utmmap,
 )
 
 
@@ -1060,6 +1062,32 @@ class TileFetcher:
 
             await asyncio.sleep(1)  # Be polite to the server
 
+    async def _discover_utmmaps_via_index(self, page, bbox):
+        """Discover the map sheet(s) covering ``bbox`` by querying the 1:4000 grid
+        layer (V_INDEX4000_<zone>_LANDNO) over WFS — NO double-click, so immune to
+        the DOL parcel-query throttle. Populates self.captured_utmmaps + layers and
+        returns the set. An area can span several sheets; all are returned (more
+        complete than the single-sheet double-click)."""
+        zone = zone_for_longitude((bbox[0] + bbox[2]) / 2)
+        parcel_layer = f"LANDSMAPS:V_PARCEL{zone}"
+        url = wfs_index_url(f"{self.DOL_URL}/geoserver/LANDSMAPS/wfs", zone, bbox)
+        txt = await page.evaluate(
+            """async (u) => {
+                try { const r = await fetch(u, { credentials: 'include' }); return await r.text(); }
+                catch (e) { return null; }
+            }""", url)
+        try:
+            data = json.loads(txt)
+        except Exception:
+            data = {}
+        for feat in data.get('features', []):
+            label = (feat.get('properties') or {}).get('indlabel1')
+            utm = label_to_utmmap(label)
+            if utm:
+                self.captured_utmmaps.add(utm)
+                self.utmmap_layers.setdefault(utm, parcel_layer)
+        return self.captured_utmmaps
+
     async def fetch_parcels_wfs(self, bbox, session_name, output_dir="output",
                                 location_info=None, utmmap=None, layer=None):
         """Lightweight WFS-direct fetch.
@@ -1135,15 +1163,24 @@ class TileFetcher:
             """)
             await asyncio.sleep(4)
             if not given_utmmap:
-                canvas = await page.query_selector('canvas')
-                canvas_box = await canvas.bounding_box() if canvas else None
-                if canvas_box:
-                    for _ in range(2):  # a couple of tries to activate + reveal the map sheet
-                        await self._try_double_click_with_offsets(
-                            page, canvas_box, spread_click_points(canvas_box, 5))
-                        await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
-                        if self.captured_utmmaps:
-                            break
+                # Primary: read the map sheet(s) straight from the WFS grid layer —
+                # no double-click, immune to the parcel-query throttle.
+                log("Discovering map sheet(s) via the WFS grid layer (no double-click)...")
+                await self._discover_utmmaps_via_index(page, bbox)
+                if self.captured_utmmaps:
+                    log(f"Grid found map sheet(s): {sorted(self.captured_utmmaps)}")
+                else:
+                    # Fallback: the old double-click activation (throttle-sensitive).
+                    log("Grid returned nothing — falling back to double-click discovery.")
+                    canvas = await page.query_selector('canvas')
+                    canvas_box = await canvas.bounding_box() if canvas else None
+                    if canvas_box:
+                        for _ in range(2):  # a couple of tries to activate + reveal the map sheet
+                            await self._try_double_click_with_offsets(
+                                page, canvas_box, spread_click_points(canvas_box, 5))
+                            await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
+                            if self.captured_utmmaps:
+                                break
 
             if self.captured_utmmaps:
                 log(f"Map sheet(s): {sorted(self.captured_utmmaps)} — fetching parcels via WFS...")
