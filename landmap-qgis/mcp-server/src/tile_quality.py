@@ -155,6 +155,46 @@ def bbox_overlaps_any(tile_bbox, boxes) -> bool:
     return False
 
 
+# ---- Parcel-search helpers (DOL allows ~20 parcel-query clicks per session) ----
+def spread_click_points(canvas_box, n):
+    """Up to ``n`` canvas click points, spread out, centre first.
+
+    Used to search for a parcel (to activate the layer) while respecting DOL's
+    per-session click budget: spend few clicks per cell and cover many cells.
+    """
+    cx = canvas_box["x"] + canvas_box["width"] / 2
+    cy = canvas_box["y"] + canvas_box["height"] / 2
+    ox = canvas_box["width"] * 0.25
+    oy = canvas_box["height"] * 0.25
+    points = [
+        (cx, cy),
+        (cx - ox, cy), (cx + ox, cy), (cx, cy - oy), (cx, cy + oy),
+        (cx - ox, cy - oy), (cx + ox, cy - oy), (cx - ox, cy + oy), (cx + ox, cy + oy),
+    ]
+    return points[:max(1, n)]
+
+
+def clicks_per_cell(num_cells, budget, cap=3):
+    """How many click positions to try per grid cell so ``budget`` clicks cover
+    all cells. DOL blocks after ~20 parcel-query clicks per session, so spending 5
+    on one cell wastes the budget — spread it thin across cells instead.
+    """
+    if num_cells <= 0:
+        return cap
+    return max(1, min(cap, budget // num_cells))
+
+
+def attempt_offset(attempt):
+    """Fractional (dx, dy) shift of the grid targets for each session-retry.
+
+    After the click budget is spent without finding a parcel, DOL requires closing
+    the session and reopening at a NEW location; shifting the targets makes a fresh
+    session probe different spots inside the same area.
+    """
+    offsets = [(0.0, 0.0), (0.25, 0.25), (-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25)]
+    return offsets[attempt % len(offsets)]
+
+
 async def refetch_blank_tiles(
     tiles: list[dict],
     images_dir: Path,

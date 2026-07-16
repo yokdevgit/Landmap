@@ -28,6 +28,9 @@ from .tile_quality import (
     refetch_blank_tiles,
     load_parcel_bboxes,
     bbox_overlaps_any,
+    spread_click_points,
+    clicks_per_cell,
+    attempt_offset,
 )
 
 
@@ -109,52 +112,41 @@ class TileFetcher:
             log(f"Error checking popup: {e}")
             return None
 
-    async def _try_double_click_with_offsets(self, page, canvas_box: dict) -> tuple[bool, bool]:
+    async def _try_double_click_with_offsets(self, page, canvas_box: dict, points=None) -> tuple[bool, bool, int]:
         """
-        Try double-clicking at different positions within the current view.
+        Double-click canvas points to find a parcel and activate the layer.
 
-        Tries: center, left 25%, right 25%, top 25%, bottom 25%
+        ``points`` is a list of (x, y) canvas coords (see
+        tile_quality.spread_click_points); if None, uses the default 5-point
+        spread. Each click counts against DOL's ~20-clicks-per-session budget.
 
-        Returns (found_data, saw_no_data):
-          found_data  - True if any position returned the "รับทราบ" (has data) popup.
-          saw_no_data - True if any position returned the explicit "ตกลง" (no data)
-                        popup, i.e. DOL confirmed there is no parcel here.
+        Returns (found_data, saw_no_data, clicks_used):
+          found_data  - True if a click returned the "รับทราบ" (has data) popup.
+          saw_no_data - True if a click returned the explicit "ตกลง" (no data) popup.
+          clicks_used - number of double-clicks actually performed.
         """
-        center_x = canvas_box['x'] + canvas_box['width'] / 2
-        center_y = canvas_box['y'] + canvas_box['height'] / 2
-        offset_x = canvas_box['width'] * 0.25
-        offset_y = canvas_box['height'] * 0.25
-
-        # Define positions to try: (name, x, y)
-        positions = [
-            ("center", center_x, center_y),
-            ("left 25%", center_x - offset_x, center_y),
-            ("right 25%", center_x + offset_x, center_y),
-            ("top 25%", center_x, center_y - offset_y),
-            ("bottom 25%", center_x, center_y + offset_y),
-        ]
+        if points is None:
+            points = spread_click_points(canvas_box, 5)
 
         saw_no_data = False
-        for name, x, y in positions:
-            log(f"  Trying {name} ({x:.0f}, {y:.0f})...")
-
+        clicks_used = 0
+        for i, (x, y) in enumerate(points):
+            log(f"  Click {i + 1}/{len(points)} at ({x:.0f}, {y:.0f})...")
             await page.mouse.dblclick(x, y)
+            clicks_used += 1
             await asyncio.sleep(3)  # Wait for popup
 
             has_data = await self._check_popup_and_close(page)
-
             if has_data is True:
-                log(f"  >>> FOUND DATA at {name}!")
-                return (True, saw_no_data)
+                log("  >>> FOUND DATA!")
+                return (True, saw_no_data, clicks_used)
             elif has_data is False:
                 saw_no_data = True
-                log(f"  >>> No data at {name}, trying next position...")
-                continue
+                log("  >>> No data here, trying next point...")
             else:
-                log(f"  >>> No popup at {name}, trying next position...")
-                continue
+                log("  >>> No popup here, trying next point...")
 
-        return (False, saw_no_data)
+        return (False, saw_no_data, clicks_used)
 
     def _calculate_grid_steps(self, bbox: list[float]) -> tuple[int, int]:
         """
@@ -194,24 +186,50 @@ class TileFetcher:
         location_info: dict = None
     ) -> dict:
         """
-        Fetch tiles by intercepting WMS requests from the website.
+        Fetch tiles, retrying in fresh browser sessions at shifted locations if a
+        session finds no parcel. DOL blocks after ~20 parcel-query clicks per
+        session, so a sparse area can exhaust the click budget without activating
+        the parcel layer; a fresh session then probes different spots.
 
-        Args:
-            bbox: [min_lon, min_lat, max_lon, max_lat] in EPSG:4326
-            session_name: Name for this session
-            zoom_level: Map zoom level (15-19)
-            output_dir: Directory to save output
-            timeout_seconds: Max time to wait for tiles
-            location_info: Optional dict with province, district, subdistrict for geometry
-
-        Returns:
-            Dict with tile_count and output_path
+        Returns dict with tile_count and output_path.
         """
         self.tiles = []
         self.captured_urls = set()
         self.captured_utmmaps = set()
         self.utmmap_layers = {}
 
+        output_path = Path(output_dir) / session_name
+        output_path.mkdir(parents=True, exist_ok=True)
+        (output_path / "images").mkdir(exist_ok=True)
+
+        MAX_SESSIONS = 3
+        for attempt in range(MAX_SESSIONS):
+            if attempt > 0:
+                log(f"\n{'=' * 55}\nSESSION RETRY {attempt + 1}/{MAX_SESSIONS}: "
+                    f"no parcel found — reopening at a different location\n{'=' * 55}")
+            found = await self._scan_session(
+                bbox, session_name, zoom_level, output_dir, location_info, attempt)
+            if found or self.tiles:
+                break
+
+        # Camera fallback for any blank tiles (opens its own fresh sessions).
+        if self.tiles:
+            await self._retry_empty_tiles(output_path, session_name, bbox, location_info, zoom_level)
+        return {"tile_count": len(self.tiles), "output_path": str(output_path)}
+
+    async def _scan_session(
+        self,
+        bbox: list[float],
+        session_name: str,
+        zoom_level: int = 17,
+        output_dir: str = "output",
+        location_info: dict = None,
+        attempt: int = 0,
+    ) -> bool:
+        """Run ONE browser session: fly the grid, click to activate the parcel
+        layer (within the per-session click budget), capture tiles, fetch WFS, and
+        re-fetch blanks. Returns True if the parcel layer was activated."""
+        found_data = False
         output_path = Path(output_dir) / session_name
         output_path.mkdir(parents=True, exist_ok=True)
         images_dir = output_path / "images"
@@ -424,13 +442,13 @@ class TileFetcher:
             if not canvas:
                 log("ERROR: No canvas found!")
                 await self._save_session(output_path, session_name, bbox, location_info)
-                return {"tile_count": 0, "output_path": str(output_path)}
+                return found_data
 
             canvas_box = await canvas.bounding_box()
             if not canvas_box:
                 log("ERROR: Could not get canvas bounding box!")
                 await self._save_session(output_path, session_name, bbox, location_info)
-                return {"tile_count": 0, "output_path": str(output_path)}
+                return found_data
 
             # Calculate pan distances based on padded bbox (covers irregular boundary edges)
             lat_range = max_lat_padded - min_lat_padded
@@ -455,6 +473,17 @@ class TileFetcher:
             total_cells = steps_x * steps_y
             log(f"Grid: {steps_x}x{steps_y} = {total_cells} cells, 10% padding, up to {TOTAL_PASSES} passes")
 
+            # DOL blocks after ~20 parcel-query clicks per session. Spread a safe
+            # budget across cells (few clicks each); on a session-retry, shift the
+            # probe targets (attempt_offset) so a fresh session tries new spots.
+            CLICK_BUDGET = 18
+            clicks_used_total = 0
+            per_cell = clicks_per_cell(total_cells, CLICK_BUDGET)
+            off_dx, off_dy = attempt_offset(attempt)
+            budget_exhausted = False
+            if attempt > 0:
+                log(f"Session attempt {attempt + 1}: probing shifted targets (offset {off_dx:+.2f},{off_dy:+.2f})")
+
             for scan_pass in range(TOTAL_PASSES):
                 cells_to_scan = [
                     (row, col)
@@ -471,8 +500,8 @@ class TileFetcher:
                 log(f"\nPass {scan_pass + 1}/{TOTAL_PASSES} — {len(cells_to_scan)} cells")
 
                 for row, col in cells_to_scan:
-                    target_lat = min_lat_padded + (lat_range * (row + 0.5) / steps_y)
-                    target_lon = min_lon_padded + (lon_range * (col + 0.5) / steps_x)
+                    target_lat = min_lat_padded + (lat_range * (row + 0.5 + off_dy) / steps_y)
+                    target_lon = min_lon_padded + (lon_range * (col + 0.5 + off_dx) / steps_x)
 
                     log(f"\n  Pass {scan_pass+1} | Cell ({col+1},{row+1}): {target_lat:.4f}, {target_lon:.4f}")
                     tiles_before_cell = len(self.tiles)
@@ -509,7 +538,15 @@ class TileFetcher:
 
                     saw_no_data = False
                     if not found_data:
-                        found, saw_no_data = await self._try_double_click_with_offsets(page, canvas_box)
+                        if clicks_used_total >= CLICK_BUDGET:
+                            log(f"Click budget ({CLICK_BUDGET}) spent — no parcel found; ending session for retry.")
+                            budget_exhausted = True
+                            break
+                        n = min(per_cell, CLICK_BUDGET - clicks_used_total)
+                        points = spread_click_points(canvas_box, n)
+                        found, saw_no_data, used = await self._try_double_click_with_offsets(page, canvas_box, points)
+                        clicks_used_total += used
+                        log(f"  Clicks used this session: {clicks_used_total}/{CLICK_BUDGET}")
                         if found:
                             found_data = True
                             log("Parcel layer activated! Continuing scan...")
@@ -528,6 +565,9 @@ class TileFetcher:
                     if len(self.tiles) >= self.MAX_TILES_PER_SESSION:
                         log(f"Reached max tiles ({self.MAX_TILES_PER_SESSION})")
                         break
+
+                if budget_exhausted and not found_data:
+                    break  # click budget spent without activation — let the session retry
 
                 new_tiles = len(self.tiles) - tiles_at_pass_start
                 log(f"\nPass {scan_pass + 1} done: +{new_tiles} tiles, {len(cells_with_tiles)}/{total_cells} cells covered")
@@ -592,14 +632,9 @@ class TileFetcher:
             await browser.close()
             await playwright.stop()
 
-        # Retry empty tiles in fresh browser sessions (up to 3 rounds)
-        if found_data:
-            await self._retry_empty_tiles(output_path, session_name, bbox, location_info, zoom_level)
-
-        return {
-            "tile_count": len(self.tiles),
-            "output_path": str(output_path)
-        }
+        # The wrapper (fetch_tiles) handles session-retry and the blank-tile
+        # camera fallback based on this return value.
+        return found_data
 
     def _make_url_fetcher(self, page):
         """Return an async fetch_url(url) -> bytes|None that GETs a WMS tile from
@@ -860,7 +895,7 @@ class TileFetcher:
                     await asyncio.sleep(3)
 
                     if not found_data and canvas_box:
-                        found, _ = await self._try_double_click_with_offsets(page, canvas_box)
+                        found, _, _ = await self._try_double_click_with_offsets(page, canvas_box)
                         if found:
                             found_data = True
 

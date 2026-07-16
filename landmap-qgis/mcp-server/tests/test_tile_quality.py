@@ -22,6 +22,9 @@ from src.tile_quality import (
     load_parcel_bboxes,
     bbox_overlaps_any,
     dominant_sort_key,
+    spread_click_points,
+    clicks_per_cell,
+    attempt_offset,
 )
 
 
@@ -238,6 +241,37 @@ def test_dominant_zoom_tile_composites_last():
     pxs = [4.0, 0.25, 2.0, 0.5, 1.0]
     ordered = sorted(pxs, key=lambda p: dominant_sort_key(p, 1.0), reverse=True)
     assert ordered[-1] == 1.0
+
+
+# ---------- parcel-search: click spread, budget, session-retry offset ----------
+def test_spread_click_points_center_first():
+    cb = {"x": 0, "y": 0, "width": 1000, "height": 800}
+    assert spread_click_points(cb, 1) == [(500.0, 400.0)]  # single click = centre
+
+
+def test_spread_click_points_count_and_center():
+    cb = {"x": 0, "y": 0, "width": 1000, "height": 800}
+    pts = spread_click_points(cb, 5)
+    assert len(pts) == 5 and pts[0] == (500.0, 400.0)  # centre first, then spread
+
+
+def test_spread_click_points_caps_at_available():
+    cb = {"x": 0, "y": 0, "width": 100, "height": 100}
+    assert len(spread_click_points(cb, 99)) == 9  # 9 distinct positions defined
+
+
+def test_clicks_per_cell_spreads_the_budget():
+    # Many cells -> 1 click each so the 20-click budget covers the whole area.
+    assert clicks_per_cell(16, 18) == 1
+    # Few cells -> a few clicks each, but capped so we never blow the budget.
+    assert clicks_per_cell(4, 18) == 3
+    assert clicks_per_cell(0, 18) == 3
+
+
+def test_attempt_offset_differs_per_session():
+    assert attempt_offset(0) == (0.0, 0.0)          # first session: no shift
+    assert attempt_offset(1) != attempt_offset(0)   # retries probe different spots
+    assert attempt_offset(2) != attempt_offset(1)
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):
