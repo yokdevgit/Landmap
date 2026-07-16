@@ -188,9 +188,12 @@ def wfs_getfeature_url(wfs_base, type_name, utmmap, bbox, epsg, max_features=500
     """Build a DOL WFS GetFeature URL for the parcels inside `bbox`.
 
     The V_PARCEL view is parameterised, so viewparams=utmmap is required; the BBOX
-    must be in the layer's native CRS (EPSG:24047/24048) to actually restrict to
-    the area. Returns the complete URL (GeoJSON output)."""
-    e0, n0, e1, n1 = bbox_to_native(bbox, epsg)
+    must be in the layer's native CRS (`epsg` = declared EPSG:24047/24048) to
+    actually restrict to the area. Because DOL omits the datum shift, the BBOX
+    *numbers* are computed in the matching WGS84/UTM zone (dol_true_epsg) so they
+    line up with the stored coordinates, then sent under the declared label so the
+    server compares them directly. Returns the complete URL (GeoJSON output)."""
+    e0, n0, e1, n1 = bbox_to_native(bbox, dol_true_epsg(epsg))
     return (
         f"{wfs_base}?service=WFS&version=1.0.0&request=GetFeature"
         f"&typeName={type_name}"
@@ -224,14 +227,16 @@ def label_to_utmmap(indlabel):
 
 def wfs_index_url(wfs_base, zone, bbox, max_features=50):
     """WFS GetFeature URL for the 1:4000 map-sheet grid (V_INDEX4000_<zone>_LANDNO)
-    over bbox, in the native CRS — used to discover the map sheet(s) click-free."""
-    epsg = 24047 if zone == 47 else 24048
-    e0, n0, e1, n1 = bbox_to_native(bbox, epsg)
+    over bbox — used to discover the map sheet(s) click-free. Same datum handling
+    as the parcel WFS: numbers in WGS84/UTM (matching the stored coords), label the
+    declared Indian-1975 CRS so the server filters without reprojecting."""
+    declared = 24047 if zone == 47 else 24048
+    e0, n0, e1, n1 = bbox_to_native(bbox, dol_true_epsg(declared))
     return (
         f"{wfs_base}?service=WFS&version=1.0.0&request=GetFeature"
         f"&typeName=LANDSMAPS:V_INDEX4000_{zone}_LANDNO"
         f"&outputFormat=application/json&maxFeatures={max_features}"
-        f"&BBOX={e0},{n0},{e1},{n1},EPSG:{epsg}"
+        f"&BBOX={e0},{n0},{e1},{n1},EPSG:{declared}"
     )
 
 
@@ -247,16 +252,32 @@ def parse_wms_utmmap(url):
 
 
 def native_epsg_for_layer(layer):
-    """DOL parcel layers are stored in Indian 1975 UTM (metres): V_PARCEL47 ->
-    EPSG:24047, V_PARCEL48 -> EPSG:24048. The WFS BBOX filter must be given in
-    this native CRS to actually restrict to the requested area (a 4326 BBOX does
-    not filter). Returns the EPSG int, or None if unknown."""
+    """DOL's *declared* parcel CRS (Indian 1975 UTM): V_PARCEL47 -> EPSG:24047,
+    V_PARCEL48 -> EPSG:24048. This is the label the WFS BBOX must carry so the
+    server does no reprojection (a 4326 BBOX does not filter at all). Note the
+    coordinates are mislabelled — see dol_true_epsg for the CRS the numbers are
+    actually on. Returns the EPSG int, or None if unknown."""
     u = (layer or "").upper()
     if "PARCEL48" in u:
         return 24048
     if "PARCEL47" in u:
         return 24047
     return None
+
+
+def dol_true_epsg(declared_epsg):
+    """Map DOL's *declared* parcel CRS (Indian 1975 UTM, EPSG:240xx) to the CRS its
+    coordinates are actually on (WGS84 UTM, EPSG:326xx) — same zone, no datum shift.
+    DOL mislabels the datum; applying the real Indian-1975 shift moves parcels
+    ~500 m NW of the basemap. Pass an int/str EPSG (24047/24048); returns the
+    corrected int (32647/32648), or the input unchanged if it isn't a 240xx code."""
+    try:
+        e = int(declared_epsg)
+    except (TypeError, ValueError):
+        return declared_epsg
+    if e in (24047, 24048):
+        return 32600 + (e - 24000)   # 24047 -> 32647, 24048 -> 32648
+    return e
 
 
 def bbox_to_native(bbox, epsg):
