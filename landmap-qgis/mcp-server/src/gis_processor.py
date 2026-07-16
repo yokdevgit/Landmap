@@ -18,7 +18,6 @@ import xml.etree.ElementTree as ET
 try:
     import geopandas as gpd
     import pandas as pd
-    from shapely.ops import transform as shp_transform
     HAS_GEOPANDAS = True
 except ImportError:
     HAS_GEOPANDAS = False
@@ -110,6 +109,26 @@ class GISProcessor:
         results = {}
 
         # 1. Parcel shapefile from WFS GeoJSON
+        import sys
+
+        # Load the admin boundary FIRST — we clip parcels to it. A subdistrict's
+        # bounding box can be ~3x its polygon area, so the WFS (BBOX-filtered)
+        # returns many parcels from neighbouring subdistricts. Clipping keeps only
+        # the requested area and roughly halves the data to reproject/write.
+        boundary_gdf = None
+        boundary_union = None
+        if location_info:
+            try:
+                boundary_gdf = boundary_service.get_geometry(
+                    location_info.get("province"), location_info.get("district"),
+                    location_info.get("subdistrict"))
+                if boundary_gdf is not None and not boundary_gdf.empty:
+                    from shapely.ops import unary_union
+                    boundary_union = unary_union(boundary_gdf.to_crs(4326).geometry.values)
+            except Exception as e:
+                print(f"Error loading boundary: {e}", file=sys.stderr)
+
+        # 1. Parcel shapefile from WFS GeoJSON
         parcel_count = 0
         if features_dir.exists():
             geojson_files = list(features_dir.glob("utmmap_*.geojson"))
@@ -121,46 +140,49 @@ class GISProcessor:
                         if not gdf.empty:
                             gdfs.append(gdf)
                     except Exception as e:
-                        import sys; print(f"Error reading {gf}: {e}", file=sys.stderr)
+                        print(f"Error reading {gf}: {e}", file=sys.stderr)
 
                 if gdfs:
                     parcel_gdf = gpd.GeoDataFrame(
-                        pd.concat(gdfs, ignore_index=True),
-                        crs=gdfs[0].crs
-                    )
-                    # Drop duplicates by geometry
+                        pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
                     parcel_gdf = parcel_gdf.drop_duplicates(subset=['geometry'])
-                    # Keep only polygon/multipolygon features (WFS sometimes includes points)
                     parcel_gdf = parcel_gdf[parcel_gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])]
-                    # Reproject Indian 1975 UTM -> WGS84 using the DOL datum transform
-                    # (the "(2)" variant; pyproj's default "(4)" lands parcels ~187 m
-                    # NW of the basemap — verified against streets + admin boundary).
+                    # Reproject Indian 1975 UTM -> WGS84 with the DOL "(2)" datum
+                    # transform (pyproj's default "(4)" lands ~187 m NW). VECTORIZED:
+                    # one pyproj call over all vertices — the old per-geometry apply
+                    # stalled on dense areas.
                     native_epsg = parcel_gdf.crs.to_epsg() if parcel_gdf.crs else None
                     if native_epsg:
+                        import numpy as np
+                        import shapely
                         tf = dol_wgs84_transformer(native_epsg)
-                        parcel_gdf['geometry'] = parcel_gdf.geometry.apply(
-                            lambda g: shp_transform(lambda x, y, z=None: tf.transform(x, y), g))
+                        geoms = parcel_gdf.geometry.values
+                        coords = shapely.get_coordinates(geoms)
+                        xs, ys = tf.transform(coords[:, 0], coords[:, 1])
+                        parcel_gdf['geometry'] = shapely.set_coordinates(
+                            np.array(geoms), np.column_stack([xs, ys]))
                         parcel_gdf = parcel_gdf.set_crs("EPSG:4326", allow_override=True)
                     else:
                         parcel_gdf = parcel_gdf.to_crs("EPSG:4326")
+                    # Clip to the requested subdistrict (keep parcels intersecting it).
+                    if boundary_union is not None:
+                        import shapely
+                        before = len(parcel_gdf)
+                        mask = shapely.intersects(parcel_gdf.geometry.values, boundary_union)
+                        parcel_gdf = parcel_gdf[mask]
+                        print(f"Clipped to boundary: {len(parcel_gdf)}/{before} parcels", file=sys.stderr)
                     parcel_gdf.to_file(data_dir / "parcel_dol.shp", encoding='utf-8')
                     parcel_count = len(parcel_gdf)
                     results['parcel_count'] = parcel_count
-                    import sys; print(f"Saved {parcel_count} parcel features", file=sys.stderr)
+                    print(f"Saved {parcel_count} parcel features", file=sys.stderr)
 
-        # 2. Boundary shapefile from our shapefile database
-        boundary_gdf = None
-        if location_info:
+        # 2. Write the boundary shapefile (loaded above).
+        if boundary_gdf is not None and not boundary_gdf.empty:
             try:
-                province = location_info.get("province")
-                district = location_info.get("district")
-                subdistrict = location_info.get("subdistrict")
-                boundary_gdf = boundary_service.get_geometry(province, district, subdistrict)
-                if boundary_gdf is not None and not boundary_gdf.empty:
-                    boundary_gdf.to_file(data_dir / "boundary.shp", encoding='utf-8')
-                    results['boundary'] = True
+                boundary_gdf.to_file(data_dir / "boundary.shp", encoding='utf-8')
+                results['boundary'] = True
             except Exception as e:
-                import sys; print(f"Error saving boundary: {e}", file=sys.stderr)
+                print(f"Error saving boundary: {e}", file=sys.stderr)
 
         # 3. Grid shapefile from utmmap IDs found during scan
         if utmmaps and parcel_count > 0:

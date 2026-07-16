@@ -35,9 +35,9 @@ def log(msg: str):
 
 
 # How many WFS map-sheet fetches to run at once. A dense subdistrict can span
-# 10+ sheets (~20 MB each); sequential fetches blew the client timeout, so we
+# 20+ sheets (~20 MB each); sequential fetches blew the client timeout, so we
 # parallelize with a small pool (kept modest to avoid tripping DOL/Incapsula).
-WFS_CONCURRENCY = 4
+WFS_CONCURRENCY = 6
 
 
 class TileFetcher:
