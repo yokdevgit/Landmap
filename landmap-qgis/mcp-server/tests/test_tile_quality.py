@@ -30,6 +30,8 @@ from src.tile_quality import (
     zone_for_longitude,
     activation_anchor,
     ACTIVATION_ANCHORS,
+    wfs_getfeature_url,
+    parse_wms_utmmap,
 )
 
 
@@ -307,6 +309,31 @@ def test_zone_for_longitude():
 def test_activation_anchor_picks_zone_anchor():
     assert activation_anchor([100.5, 13.7, 100.52, 13.72]) == ACTIVATION_ANCHORS[47]   # Bangkok
     assert activation_anchor([104.8, 15.2, 104.9, 15.3]) == ACTIVATION_ANCHORS[48]      # Ubon
+
+
+# ---------- WFS-direct helpers ----------
+def test_wfs_getfeature_url():
+    u = wfs_getfeature_url("https://x/wfs", "LANDSMAPS:V_PARCEL47", "474619676",
+                           [98.9775, 18.781, 98.9934, 18.7896], 24047, max_features=50000)
+    assert "request=GetFeature" in u
+    assert "typeName=LANDSMAPS:V_PARCEL47" in u
+    assert "viewparams=utmmap:474619676" in u
+    assert "outputFormat=application/json" in u
+    assert "maxFeatures=50000" in u
+    assert "EPSG:24047" in u
+    assert "&BBOX=498" in u  # native easting, verified against live WFS
+
+
+def test_parse_wms_utmmap():
+    url = ("https://landsmaps.dol.go.th/geoserver/LANDSMAPS/wms?"
+           "LAYERS=LANDSMAPS%3AV_PARCEL47&viewparams=utmmap%3A503624816&format=image%2Fpng")
+    utm, layer = parse_wms_utmmap(url)
+    assert utm == "503624816"
+    assert layer == "LANDSMAPS:V_PARCEL47"
+
+
+def test_parse_wms_utmmap_missing():
+    assert parse_wms_utmmap("https://x/wms?service=WMS&request=GetMap") == (None, None)
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):

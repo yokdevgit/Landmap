@@ -555,6 +555,9 @@ class GISProcessor:
         gis_dir = session_dir / "gis"
         if not gis_dir.exists():
             await self.process_session(session_name)
+        # A WFS-direct session has no tiles, so process_session creates nothing —
+        # make sure the folder exists so the vector-only .qgs can still be written.
+        gis_dir.mkdir(parents=True, exist_ok=True)
 
         # Write boundary as GeoJSON to gis/ so the QGS can use it via relative path.
         # GeoJSON avoids DBF encoding issues with Thai text that can break the OGR provider

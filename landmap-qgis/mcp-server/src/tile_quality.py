@@ -184,6 +184,34 @@ def clicks_per_cell(num_cells, budget, cap=3):
     return max(1, min(cap, budget // num_cells))
 
 
+def wfs_getfeature_url(wfs_base, type_name, utmmap, bbox, epsg, max_features=50000):
+    """Build a DOL WFS GetFeature URL for the parcels inside `bbox`.
+
+    The V_PARCEL view is parameterised, so viewparams=utmmap is required; the BBOX
+    must be in the layer's native CRS (EPSG:24047/24048) to actually restrict to
+    the area. Returns the complete URL (GeoJSON output)."""
+    e0, n0, e1, n1 = bbox_to_native(bbox, epsg)
+    return (
+        f"{wfs_base}?service=WFS&version=1.0.0&request=GetFeature"
+        f"&typeName={type_name}"
+        f"&viewparams=utmmap:{utmmap}"
+        f"&outputFormat=application/json"
+        f"&maxFeatures={max_features}"
+        f"&BBOX={e0},{n0},{e1},{n1},EPSG:{epsg}"
+    )
+
+
+def parse_wms_utmmap(url):
+    """Extract (utmmap, layer) from a DOL WMS tile URL, or (None, None)."""
+    import re
+    from urllib.parse import urlparse, parse_qs
+    q = parse_qs(urlparse(url).query)
+    viewparams = q.get('viewparams', q.get('VIEWPARAMS', ['']))[0]
+    layer = q.get('LAYERS', q.get('layers', ['']))[0] or None
+    m = re.search(r'utmmap:(\d+)', viewparams)
+    return (m.group(1) if m else None, layer)
+
+
 def native_epsg_for_layer(layer):
     """DOL parcel layers are stored in Indian 1975 UTM (metres): V_PARCEL47 ->
     EPSG:24047, V_PARCEL48 -> EPSG:24048. The WFS BBOX filter must be given in

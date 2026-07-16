@@ -35,6 +35,8 @@ from .tile_quality import (
     bbox_to_native,
     zone_for_longitude,
     activation_anchor,
+    wfs_getfeature_url,
+    parse_wms_utmmap,
 )
 
 
@@ -1021,35 +1023,29 @@ class TileFetcher:
 
             # BBOX filter in the layer's native CRS, so we get the parcels inside
             # the requested area rather than the whole (huge) map sheet.
-            bbox_param = ''
             native_epsg = native_epsg_for_layer(wms_layer)
+            url = None
             if bbox and native_epsg:
                 try:
-                    e0, n0, e1, n1 = bbox_to_native(bbox, native_epsg)
-                    bbox_param = f"&BBOX={e0},{n0},{e1},{n1},EPSG:{native_epsg}"
+                    url = wfs_getfeature_url(WFS_BASE, type_name, utmmap, bbox, native_epsg)
                 except Exception as e:
                     log(f"  WFS bbox reproject failed ({e}); fetching whole sheet")
+            if url is None:  # no bbox -> whole map sheet (fallback)
+                url = (f"{WFS_BASE}?service=WFS&version=1.0.0&request=GetFeature"
+                       f"&typeName={type_name}&viewparams=utmmap:{utmmap}"
+                       f"&outputFormat=application/json&maxFeatures=50000")
 
-            log(f"  WFS utmmap {utmmap} (layer={type_name}){' + bbox' if bbox_param else ''}: fetching...")
+            log(f"  WFS utmmap {utmmap} (layer={type_name}){' + bbox' if (bbox and native_epsg) else ''}: fetching...")
             try:
-                result = await page.evaluate(f"""
-                    async () => {{
-                        const url = '{WFS_BASE}?service=WFS&version=1.0.0&request=GetFeature' +
-                            '&typeName={type_name}' +
-                            '&viewparams=utmmap:{utmmap}' +
-                            '&outputFormat=application/json' +
-                            '&maxFeatures=50000' +
-                            '{bbox_param}';
-                        try {{
-                            const resp = await fetch(url, {{ credentials: 'include' }});
-                            if (!resp.ok) return {{ error: resp.status }};
-                            const data = await resp.json();
-                            return data;
-                        }} catch(e) {{
-                            return {{ error: e.toString() }};
-                        }}
-                    }}
-                """)
+                result = await page.evaluate("""
+                    async (url) => {
+                        try {
+                            const resp = await fetch(url, { credentials: 'include' });
+                            if (!resp.ok) return { error: resp.status };
+                            return await resp.json();
+                        } catch(e) { return { error: e.toString() }; }
+                    }
+                """, url)
 
                 if result and 'error' not in result:
                     feature_count = len(result.get('features', []))
@@ -1063,6 +1059,109 @@ class TileFetcher:
                 log(f"  WFS utmmap {utmmap}: error - {e}")
 
             await asyncio.sleep(1)  # Be polite to the server
+
+    async def fetch_parcels_wfs(self, bbox, session_name, output_dir="output", location_info=None):
+        """Lightweight WFS-direct fetch.
+
+        Activate the parcel layer with a few clicks just to read the map-sheet id,
+        then make ONE BBOX-filtered WFS call for the complete parcels — ~3-5 DOL
+        requests instead of ~50 for the full tile scan. No tiles are saved; the
+        vector geojson is the output. Returns {utmmaps, feature_count, output_path}.
+        """
+        self.tiles = []
+        self.captured_urls = set()
+        self.captured_utmmaps = set()
+        self.utmmap_layers = {}
+        output_path = Path(output_dir) / session_name
+        output_path.mkdir(parents=True, exist_ok=True)
+        features_dir = output_path / "features"
+        features_dir.mkdir(exist_ok=True)
+        center_lon = (bbox[0] + bbox[2]) / 2
+        center_lat = (bbox[1] + bbox[3]) / 2
+
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=False, args=['--disable-blink-features=AutomationControlled'])
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='th-TH')
+        page = await context.new_page()
+
+        # Minimal interceptor: grab the map-sheet id from the first parcel WMS tile.
+        def on_response(response):
+            if 'geoserver' not in response.url.lower():
+                return
+            utm, layer = parse_wms_utmmap(response.url)
+            if utm:
+                self.captured_utmmaps.add(utm)
+                if layer and utm not in self.utmmap_layers:
+                    self.utmmap_layers[utm] = layer
+        page.on('response', on_response)
+
+        feature_count = 0
+        try:
+            log("WFS-direct: opening DOL website...")
+            await page.goto(self.DOL_URL, timeout=120000)
+            await asyncio.sleep(10)
+            try:
+                await page.wait_for_selector('canvas', timeout=60000)
+                await page.wait_for_function(
+                    "() => typeof viewer !== 'undefined' && viewer && viewer.camera", timeout=60000)
+                log("Cesium viewer ready.")
+            except Exception:
+                log("WARNING: viewer not confirmed ready.")
+
+            # Fly to the target and activate the parcel layer to reveal the utmmap.
+            await page.evaluate(f"""
+                () => {{
+                    if (typeof viewer !== 'undefined' && viewer.camera) {{
+                        viewer.camera.flyTo({{ destination: Cesium.Cartesian3.fromDegrees({center_lon}, {center_lat}, 1500), duration: 2 }});
+                    }}
+                }}
+            """)
+            await asyncio.sleep(4)
+            canvas = await page.query_selector('canvas')
+            canvas_box = await canvas.bounding_box() if canvas else None
+            if canvas_box:
+                for _ in range(2):  # a couple of tries to activate + reveal the map sheet
+                    await self._try_double_click_with_offsets(
+                        page, canvas_box, spread_click_points(canvas_box, 5))
+                    await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
+                    if self.captured_utmmaps:
+                        break
+
+            if self.captured_utmmaps:
+                log(f"Map sheet(s): {sorted(self.captured_utmmaps)} — fetching parcels via WFS...")
+                await self._fetch_wfs_features(page, self.captured_utmmaps, features_dir,
+                                               self.utmmap_layers, bbox)
+            else:
+                log("Could not determine the map sheet (no parcel activated) — no WFS fetch.")
+
+            await self._save_session(output_path, session_name, bbox, location_info)
+            for gj in features_dir.glob("*.geojson"):
+                try:
+                    feature_count += len(json.loads(gj.read_text(encoding='utf-8')).get('features', []))
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"WFS-direct error: {e}")
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
+
+        return {
+            "utmmaps": sorted(self.captured_utmmaps),
+            "feature_count": feature_count,
+            "output_path": str(output_path),
+        }
 
     async def _save_session(self, output_path: Path, session_name: str, bbox: list[float], location_info: dict = None):
         """Save mission data with tile information."""

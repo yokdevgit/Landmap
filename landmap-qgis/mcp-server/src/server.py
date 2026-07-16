@@ -158,6 +158,25 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="fetch_parcels_wfs",
+            description="ดึงรูปแปลงที่ดิน (vector) แบบเร็วผ่าน WFS โดยตรง — คลิกน้อย ใช้ requests น้อยกว่า fetch_landmap_tiles มาก เหมาะเมื่อโดน rate limit (Lightweight WFS-direct parcel fetch: ~3-5 DOL requests, crisp complete vector, no tile scan)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "bbox": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Bounding box [min_lon, min_lat, max_lon, max_lat]"
+                    },
+                    "province": {"type": "string", "description": "ชื่อจังหวัด (ใช้แทน bbox ได้)"},
+                    "district": {"type": "string", "description": "ชื่ออำเภอ (optional)"},
+                    "subdistrict": {"type": "string", "description": "ชื่อตำบล (optional)"},
+                    "session_name": {"type": "string", "description": "ชื่อ session สำหรับบันทึกผลลัพธ์"}
+                },
+                "required": ["session_name"]
+            }
+        ),
+        Tool(
             name="process_to_gis",
             description="แปลง tiles ที่ดึงมาเป็นไฟล์ GIS (PNG + PGW + QLR) สำหรับ QGIS",
             inputSchema={
@@ -312,6 +331,37 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                      f"BBOX: {bbox}\n" +
                      f"บันทึกที่: {result['output_path']}\n\n" +
                      f"ใช้คำสั่ง process_to_gis เพื่อแปลงเป็นไฟล์ GIS"
+            )]
+
+        elif name == "fetch_parcels_wfs":
+            session_name = arguments.get("session_name", "default")
+            bbox = arguments.get("bbox")
+            location_info = None
+            if not bbox:
+                province = arguments.get("province")
+                district = arguments.get("district")
+                subdistrict = arguments.get("subdistrict")
+                if not province:
+                    return [TextContent(type="text", text="กรุณาระบุ bbox หรือ province")]
+                bbox_result = boundary_service.get_bbox(province, district, subdistrict)
+                if not bbox_result:
+                    return [TextContent(type="text", text="ไม่พบพื้นที่ที่ระบุ")]
+                bbox = bbox_result["bbox"]
+                location_info = {"province": province, "district": district, "subdistrict": subdistrict}
+
+            result = await tile_fetcher.fetch_parcels_wfs(
+                bbox=bbox, session_name=session_name, output_dir=OUTPUT_DIR, location_info=location_info
+            )
+
+            return [TextContent(
+                type="text",
+                text=f"ดึงรูปแปลงที่ดิน (WFS) สำเร็จ!\n\n" +
+                     f"Session: {session_name}\n" +
+                     f"Map sheet(s): {', '.join(result['utmmaps']) if result['utmmaps'] else '-'}\n" +
+                     f"จำนวนแปลง (parcels): {result['feature_count']}\n" +
+                     f"BBOX: {bbox}\n" +
+                     f"บันทึกที่: {result['output_path']}\n\n" +
+                     f"ใช้ process_to_shapefiles เพื่อสร้าง .qgs (vector จริง)"
             )]
 
         elif name == "process_to_gis":
