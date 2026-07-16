@@ -725,7 +725,10 @@ class GISProcessor:
             p3857 = gis_dir / "parcel_dol_3857.geojson"
             try:
                 _reproject_to_3857(parcel_shp, p3857)
-                vector_layers.append({"id": lid, "name": "Parcel (DOL)", "src": "./parcel_dol_3857.geojson", "style": "parcel_dol", "checked": "Qt::Unchecked"})
+                # Visible by default: the WFS vector is now BBOX-filtered to the
+                # area (complete + crisp), so it is the primary parcel display —
+                # unlike the lossy raster tiles it has no gaps or thin lines.
+                vector_layers.append({"id": lid, "name": "Parcel (DOL)", "src": "./parcel_dol_3857.geojson", "style": "parcel_dol", "checked": "Qt::Checked"})
             except Exception as e:
                 print(f"Parcel reproject failed: {e}", file=sys.stderr)
         if boundary_geojson and boundary_geojson.exists() and gis_dir:

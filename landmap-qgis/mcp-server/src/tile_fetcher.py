@@ -31,6 +31,8 @@ from .tile_quality import (
     spread_click_points,
     clicks_per_cell,
     attempt_offset,
+    native_epsg_for_layer,
+    bbox_to_native,
 )
 
 
@@ -596,7 +598,7 @@ class TileFetcher:
                     features_dir = output_path / "features"
                     features_dir.mkdir(exist_ok=True)
                     log(f"\nFetching WFS vector data for {len(self.captured_utmmaps)} utmmap(s)...")
-                    await self._fetch_wfs_features(page, self.captured_utmmaps, features_dir, self.utmmap_layers)
+                    await self._fetch_wfs_features(page, self.captured_utmmaps, features_dir, self.utmmap_layers, bbox)
 
             # Stop intercepting first: the live Cesium map keeps requesting tiles
             # and the re-fetch responses below would otherwise be re-captured as
@@ -938,10 +940,17 @@ class TileFetcher:
 
         return replaced_count[0]
 
-    async def _fetch_wfs_features(self, page, utmmaps: set[str], features_dir: Path, utmmap_layers: dict[str, str] = None):
+    async def _fetch_wfs_features(self, page, utmmaps: set[str], features_dir: Path,
+                                 utmmap_layers: dict[str, str] = None, bbox: list[float] = None):
         """
         Fetch parcel vector data from DOL WFS for each utmmap.
         Uses the same layer name that was captured for each utmmap (V_PARCEL47 or V_PARCEL48).
+
+        A utmmap map sheet spans ~28 km, far larger than a subdistrict, and the WFS
+        caps at maxFeatures — so without a filter it returns thousands of parcels
+        mostly OUTSIDE the area. We add a BBOX filter in the layer's native UTM CRS
+        (EPSG:24047/24048; a 4326 BBOX does not restrict) so the WFS returns the
+        parcels actually inside `bbox`.
         """
         WFS_BASE = "https://landsmaps.dol.go.th/geoserver/LANDSMAPS/wfs"
         if utmmap_layers is None:
@@ -959,7 +968,18 @@ class TileFetcher:
             # Convert WMS layer name to WFS typeName (same name in DOL's geoserver)
             type_name = wms_layer  # e.g. "LANDSMAPS:V_PARCEL48"
 
-            log(f"  WFS utmmap {utmmap} (layer={type_name}): fetching...")
+            # BBOX filter in the layer's native CRS, so we get the parcels inside
+            # the requested area rather than the whole (huge) map sheet.
+            bbox_param = ''
+            native_epsg = native_epsg_for_layer(wms_layer)
+            if bbox and native_epsg:
+                try:
+                    e0, n0, e1, n1 = bbox_to_native(bbox, native_epsg)
+                    bbox_param = f"&BBOX={e0},{n0},{e1},{n1},EPSG:{native_epsg}"
+                except Exception as e:
+                    log(f"  WFS bbox reproject failed ({e}); fetching whole sheet")
+
+            log(f"  WFS utmmap {utmmap} (layer={type_name}){' + bbox' if bbox_param else ''}: fetching...")
             try:
                 result = await page.evaluate(f"""
                     async () => {{
@@ -967,7 +987,8 @@ class TileFetcher:
                             '&typeName={type_name}' +
                             '&viewparams=utmmap:{utmmap}' +
                             '&outputFormat=application/json' +
-                            '&maxFeatures=5000';
+                            '&maxFeatures=50000' +
+                            '{bbox_param}';
                         try {{
                             const resp = await fetch(url, {{ credentials: 'include' }});
                             if (!resp.ok) return {{ error: resp.status }};

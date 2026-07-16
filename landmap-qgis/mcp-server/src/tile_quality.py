@@ -184,6 +184,29 @@ def clicks_per_cell(num_cells, budget, cap=3):
     return max(1, min(cap, budget // num_cells))
 
 
+def native_epsg_for_layer(layer):
+    """DOL parcel layers are stored in Indian 1975 UTM (metres): V_PARCEL47 ->
+    EPSG:24047, V_PARCEL48 -> EPSG:24048. The WFS BBOX filter must be given in
+    this native CRS to actually restrict to the requested area (a 4326 BBOX does
+    not filter). Returns the EPSG int, or None if unknown."""
+    u = (layer or "").upper()
+    if "PARCEL48" in u:
+        return 24048
+    if "PARCEL47" in u:
+        return 24047
+    return None
+
+
+def bbox_to_native(bbox, epsg):
+    """Reproject a [minlon, minlat, maxlon, maxlat] EPSG:4326 bbox to the given
+    projected EPSG, returning (minE, minN, maxE, maxN) for a WFS BBOX filter."""
+    from pyproj import Transformer
+    t = Transformer.from_crs(4326, epsg, always_xy=True)
+    min_e, min_n = t.transform(bbox[0], bbox[1])
+    max_e, max_n = t.transform(bbox[2], bbox[3])
+    return (min_e, min_n, max_e, max_n)
+
+
 def attempt_offset(attempt):
     """Fractional (dx, dy) shift of the grid targets for each session-retry.
 

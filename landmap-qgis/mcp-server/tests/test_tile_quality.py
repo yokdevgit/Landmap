@@ -25,6 +25,8 @@ from src.tile_quality import (
     spread_click_points,
     clicks_per_cell,
     attempt_offset,
+    native_epsg_for_layer,
+    bbox_to_native,
 )
 
 
@@ -272,6 +274,22 @@ def test_attempt_offset_differs_per_session():
     assert attempt_offset(0) == (0.0, 0.0)          # first session: no shift
     assert attempt_offset(1) != attempt_offset(0)   # retries probe different spots
     assert attempt_offset(2) != attempt_offset(1)
+
+
+# ---------- WFS BBOX filter: native UTM CRS per parcel zone ----------
+def test_native_epsg_for_layer():
+    assert native_epsg_for_layer("LANDSMAPS:V_PARCEL47") == 24047
+    assert native_epsg_for_layer("LANDSMAPS:V_PARCEL48") == 24048
+    assert native_epsg_for_layer("") is None
+
+
+def test_bbox_to_native_matches_known_value():
+    # rb_phrasing_1 bbox in EPSG:24047 — verified against live DOL WFS.
+    e0, n0, e1, n1 = bbox_to_native([98.9775, 18.781, 98.9934, 18.7896], 24047)
+    assert abs(e0 - 498145.6) < 2
+    assert abs(n0 - 2076243.2) < 2
+    assert abs(e1 - 499821.3) < 2
+    assert abs(n1 - 2077194.6) < 2
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):
