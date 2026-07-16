@@ -47,6 +47,12 @@ def log(msg: str):
     print(msg, file=sys.stderr)
 
 
+# How many WFS map-sheet fetches to run at once. A dense subdistrict can span
+# 10+ sheets (~20 MB each); sequential fetches blew the client timeout, so we
+# parallelize with a small pool (kept modest to avoid tripping DOL/Incapsula).
+WFS_CONCURRENCY = 4
+
+
 class TileFetcher:
     """Fetch land map tiles by intercepting actual website requests."""
 
@@ -1011,20 +1017,15 @@ class TileFetcher:
         if utmmap_layers is None:
             utmmap_layers = {}
 
+        # Build the work list (skip already-cached sheets).
+        work = []
         for utmmap in sorted(utmmaps):
             out_path = features_dir / f"utmmap_{utmmap}.geojson"
             if out_path.exists():
                 log(f"  WFS utmmap {utmmap}: already cached, skipping")
                 continue
-
-            # Use the layer name from the captured WMS tile (e.g. LANDSMAPS:V_PARCEL48)
-            # Fall back to V_PARCEL47 if unknown
             wms_layer = utmmap_layers.get(utmmap, "LANDSMAPS:V_PARCEL47")
-            # Convert WMS layer name to WFS typeName (same name in DOL's geoserver)
-            type_name = wms_layer  # e.g. "LANDSMAPS:V_PARCEL48"
-
-            # BBOX filter in the layer's native CRS, so we get the parcels inside
-            # the requested area rather than the whole (huge) map sheet.
+            type_name = wms_layer  # DOL geoserver uses the same name for WFS
             native_epsg = native_epsg_for_layer(wms_layer)
             url = None
             if bbox and native_epsg:
@@ -1036,57 +1037,87 @@ class TileFetcher:
                 url = (f"{WFS_BASE}?service=WFS&version=1.0.0&request=GetFeature"
                        f"&typeName={type_name}&viewparams=utmmap:{utmmap}"
                        f"&outputFormat=application/json&maxFeatures=50000")
+            work.append((utmmap, type_name, url, out_path))
 
-            log(f"  WFS utmmap {utmmap} (layer={type_name}){' + bbox' if (bbox and native_epsg) else ''}: fetching...")
-            try:
-                result = await page.evaluate("""
-                    async (url) => {
-                        try {
-                            const resp = await fetch(url, { credentials: 'include' });
-                            if (!resp.ok) return { error: resp.status };
-                            return await resp.json();
-                        } catch(e) { return { error: e.toString() }; }
-                    }
-                """, url)
+        if not work:
+            return
 
-                if result and 'error' not in result:
-                    feature_count = len(result.get('features', []))
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, ensure_ascii=False)
-                    log(f"  WFS utmmap {utmmap}: {feature_count} features saved")
-                else:
-                    log(f"  WFS utmmap {utmmap}: failed - {result}")
+        # Fetch sheets CONCURRENTLY (bounded). A subdistrict can span 10+ map
+        # sheets, each up to ~20 MB; sequential fetches took 10+ minutes and blew
+        # the Claude Desktop timeout. context.request shares the page's Incapsula
+        # cookie and gives real parallelism; page.evaluate is the per-sheet fallback.
+        log(f"  Fetching {len(work)} map sheet(s) via WFS (up to {WFS_CONCURRENCY} in parallel)...")
+        context = page.context
+        sem = asyncio.Semaphore(WFS_CONCURRENCY)
 
-            except Exception as e:
-                log(f"  WFS utmmap {utmmap}: error - {e}")
+        async def fetch_one(utmmap, type_name, url, out_path):
+            async with sem:
+                try:
+                    resp = await context.request.get(url, timeout=90000)
+                    if resp.ok:
+                        text = await resp.text()
+                        try:
+                            data = json.loads(text)
+                        except Exception:
+                            data = None
+                        if isinstance(data, dict) and 'features' in data:
+                            out_path.write_text(text, encoding='utf-8')
+                            log(f"  WFS utmmap {utmmap}: {len(data['features'])} features saved")
+                            return
+                    # Fall back to an in-page fetch (same-origin, passes Incapsula JS).
+                    result = await page.evaluate(
+                        """async (url) => {
+                            try { const r = await fetch(url, { credentials: 'include' });
+                                  if (!r.ok) return { error: r.status }; return await r.json(); }
+                            catch(e) { return { error: e.toString() }; }
+                        }""", url)
+                    if result and 'error' not in result:
+                        out_path.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
+                        log(f"  WFS utmmap {utmmap}: {len(result.get('features', []))} features saved (fallback)")
+                    else:
+                        log(f"  WFS utmmap {utmmap}: failed - {result}")
+                except Exception as e:
+                    log(f"  WFS utmmap {utmmap}: error - {e}")
 
-            await asyncio.sleep(1)  # Be polite to the server
+        await asyncio.gather(*[fetch_one(*w) for w in work])
 
-    async def _discover_utmmaps_via_index(self, page, bbox):
+    async def _discover_utmmaps_via_index(self, page, bbox, attempts=4):
         """Discover the map sheet(s) covering ``bbox`` by querying the 1:4000 grid
         layer (V_INDEX4000_<zone>_LANDNO) over WFS — NO double-click, so immune to
-        the DOL parcel-query throttle. Populates self.captured_utmmaps + layers and
-        returns the set. An area can span several sheets; all are returned (more
-        complete than the single-sheet double-click)."""
+        the DOL parcel-query throttle. Populates self.captured_utmmaps + layers.
+
+        Retries a few times: right after page load the Incapsula cookie may not be
+        set yet, so the first fetch can return the challenge HTML instead of JSON.
+        Returns "found" / "empty" (valid JSON, no sheets) / "blocked" (never got
+        JSON — likely Incapsula/throttle) so the caller can fail fast instead of
+        hanging on the Cesium fallback."""
         zone = zone_for_longitude((bbox[0] + bbox[2]) / 2)
         parcel_layer = f"LANDSMAPS:V_PARCEL{zone}"
         url = wfs_index_url(f"{self.DOL_URL}/geoserver/LANDSMAPS/wfs", zone, bbox)
-        txt = await page.evaluate(
-            """async (u) => {
-                try { const r = await fetch(u, { credentials: 'include' }); return await r.text(); }
-                catch (e) { return null; }
-            }""", url)
-        try:
-            data = json.loads(txt)
-        except Exception:
-            data = {}
-        for feat in data.get('features', []):
-            label = (feat.get('properties') or {}).get('indlabel1')
-            utm = label_to_utmmap(label)
-            if utm:
-                self.captured_utmmaps.add(utm)
-                self.utmmap_layers.setdefault(utm, parcel_layer)
-        return self.captured_utmmaps
+        got_json = False
+        for i in range(attempts):
+            txt = await page.evaluate(
+                """async (u) => {
+                    try { const r = await fetch(u, { credentials: 'include' }); return await r.text(); }
+                    catch (e) { return null; }
+                }""", url)
+            try:
+                data = json.loads(txt)
+                got_json = True
+            except Exception:
+                data = None
+            if data is not None:
+                for feat in data.get('features', []):
+                    label = (feat.get('properties') or {}).get('indlabel1')
+                    utm = label_to_utmmap(label)
+                    if utm:
+                        self.captured_utmmaps.add(utm)
+                        self.utmmap_layers.setdefault(utm, parcel_layer)
+                if self.captured_utmmaps:
+                    return "found"
+            if i < attempts - 1:
+                await asyncio.sleep(4)  # let the Incapsula cookie settle, then retry
+        return "empty" if got_json else "blocked"
 
     async def fetch_parcels_wfs(self, bbox, session_name, output_dir="output",
                                 location_info=None, utmmap=None, layer=None):
@@ -1143,44 +1174,56 @@ class TileFetcher:
         feature_count = 0
         try:
             log("WFS-direct: opening DOL website...")
-            await page.goto(self.DOL_URL, timeout=120000)
-            await asyncio.sleep(10)
+            # The click-free WFS path does NOT need the Cesium 3D viewer — it only
+            # needs the page loaded far enough to carry the Incapsula cookie. So we
+            # DON'T wait for the canvas/viewer here (that wait, ~2 min worst case,
+            # was the cause of the ~4-minute Claude Desktop timeouts on throttled
+            # sessions). We just load the DOM and let the index retry-loop handle
+            # any Incapsula-cookie delay.
             try:
-                await page.wait_for_selector('canvas', timeout=60000)
-                await page.wait_for_function(
-                    "() => typeof viewer !== 'undefined' && viewer && viewer.camera", timeout=60000)
-                log("Cesium viewer ready.")
-            except Exception:
-                log("WARNING: viewer not confirmed ready.")
-
-            # Fly to the target and activate the parcel layer to reveal the utmmap.
-            await page.evaluate(f"""
-                () => {{
-                    if (typeof viewer !== 'undefined' && viewer.camera) {{
-                        viewer.camera.flyTo({{ destination: Cesium.Cartesian3.fromDegrees({center_lon}, {center_lat}, 1500), duration: 2 }});
-                    }}
-                }}
-            """)
+                await page.goto(self.DOL_URL, timeout=60000, wait_until='domcontentloaded')
+            except Exception as e:
+                log(f"Page load slow/incomplete ({e}) — trying WFS anyway.")
             await asyncio.sleep(4)
+
             if not given_utmmap:
                 # Primary: read the map sheet(s) straight from the WFS grid layer —
                 # no double-click, immune to the parcel-query throttle.
                 log("Discovering map sheet(s) via the WFS grid layer (no double-click)...")
-                await self._discover_utmmaps_via_index(page, bbox)
-                if self.captured_utmmaps:
+                status = await self._discover_utmmaps_via_index(page, bbox)
+                if status == "found":
                     log(f"Grid found map sheet(s): {sorted(self.captured_utmmaps)}")
+                elif status == "blocked":
+                    # Never got JSON back — Incapsula/throttle. Don't hang on the
+                    # Cesium fallback (it would wait minutes for a viewer that will
+                    # never init while blocked); surface a clear back-off instead.
+                    log("DOL WFS returned no JSON after retries — likely rate-limited/"
+                        "blocked (Incapsula). Backing off; try again in a few minutes.")
                 else:
-                    # Fallback: the old double-click activation (throttle-sensitive).
-                    log("Grid returned nothing — falling back to double-click discovery.")
-                    canvas = await page.query_selector('canvas')
-                    canvas_box = await canvas.bounding_box() if canvas else None
-                    if canvas_box:
-                        for _ in range(2):  # a couple of tries to activate + reveal the map sheet
-                            await self._try_double_click_with_offsets(
-                                page, canvas_box, spread_click_points(canvas_box, 5))
-                            await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
-                            if self.captured_utmmaps:
-                                break
+                    # Valid JSON but no sheet here — rare. Try the double-click
+                    # fallback, but only now wait (briefly) for the 3D viewer.
+                    log("Grid returned no sheet — trying double-click fallback.")
+                    try:
+                        await page.wait_for_selector('canvas', timeout=30000)
+                        await page.wait_for_function(
+                            "() => typeof viewer !== 'undefined' && viewer && viewer.camera",
+                            timeout=30000)
+                        await page.evaluate(f"""() => {{
+                            if (typeof viewer !== 'undefined' && viewer.camera) {{
+                                viewer.camera.flyTo({{ destination: Cesium.Cartesian3.fromDegrees({center_lon}, {center_lat}, 1500), duration: 2 }});
+                            }} }}""")
+                        await asyncio.sleep(4)
+                        canvas = await page.query_selector('canvas')
+                        canvas_box = await canvas.bounding_box() if canvas else None
+                        if canvas_box:
+                            for _ in range(2):
+                                await self._try_double_click_with_offsets(
+                                    page, canvas_box, spread_click_points(canvas_box, 5))
+                                await asyncio.sleep(3)
+                                if self.captured_utmmaps:
+                                    break
+                    except Exception as e:
+                        log(f"Cesium viewer not ready for fallback ({e}).")
 
             if self.captured_utmmaps:
                 log(f"Map sheet(s): {sorted(self.captured_utmmaps)} — fetching parcels via WFS...")
