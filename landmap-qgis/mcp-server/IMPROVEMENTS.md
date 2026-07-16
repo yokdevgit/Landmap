@@ -5,7 +5,20 @@ Newest / highest-impact first. See git history for what has already been fixed.
 
 ## Reliability
 
-### DOL IP-based rate-limiting under rapid/successive fetches  ⚠️ (biggest gap)
+### ✅ Click-free WFS fetch — bypasses the parcel-query throttle (done)
+- `fetch_parcels_wfs` no longer double-clicks to find the map sheet. It reads the
+  1:4000 grid layer `V_INDEX4000_{zone}_LANDNO` over WFS and derives the utmmap
+  from the sheet label (`utmmap = utm1 + roman-section-digit + number`, e.g.
+  "4746 I 9876" → 474619876), then fetches parcels via the un-throttled WFS
+  GetFeature endpoint. Both discovery and data avoid the throttled double-click
+  backend entirely. The double-click survives only as a fallback.
+- Verified live: Phra Sing discovered sheet 474619876 with zero clicks, 3319
+  in-bbox parcels (commit 66705b7). Helpers `label_to_utmmap` + `wfs_index_url`
+  in `tile_quality.py`.
+- Note: the throttle below still affects the **tile-based** `fetch_landmap_tiles`
+  path (which needs the double-click to activate WMS tiles). Prefer the WFS path.
+
+### DOL IP-based rate-limiting under rapid/successive fetches  ⚠️ (tile path only)
 - **Symptom:** the first fetch of a session works; after ~3–4 back-to-back
   fetches, subsequent fetches on *any* area (even one that just succeeded) get
   **0 tiles**. Every parcel double-click returns "no popup" or "ตกลง / no data",
