@@ -207,10 +207,16 @@ class TileFetcher:
             if attempt > 0:
                 log(f"\n{'=' * 55}\nSESSION RETRY {attempt + 1}/{MAX_SESSIONS}: "
                     f"no parcel found — reopening at a different location\n{'=' * 55}")
-            found = await self._scan_session(
+            status = await self._scan_session(
                 bbox, session_name, zoom_level, output_dir, location_info, attempt)
-            if found or self.tiles:
+            if status == "found" or self.tiles:
                 break
+            if status == "blocked":
+                # Browser closed / DOL IP throttle — retrying would only hammer
+                # DOL harder and not help. Back off.
+                log("Session blocked (likely DOL IP throttle / load) — backing off, not retrying.")
+                break
+            # status == "no_parcel": genuinely searched, no hit → retry elsewhere
 
         # Camera fallback for any blank tiles (opens its own fresh sessions).
         if self.tiles:
@@ -228,8 +234,11 @@ class TileFetcher:
     ) -> bool:
         """Run ONE browser session: fly the grid, click to activate the parcel
         layer (within the per-session click budget), capture tiles, fetch WFS, and
-        re-fetch blanks. Returns True if the parcel layer was activated."""
+        re-fetch blanks. Returns a status: 'found' (layer activated), 'no_parcel'
+        (searched but no hit — retry elsewhere), or 'blocked' (browser closed /
+        DOL throttle — back off)."""
         found_data = False
+        blocked = False
         output_path = Path(output_dir) / session_name
         output_path.mkdir(parents=True, exist_ok=True)
         images_dir = output_path / "images"
@@ -442,13 +451,13 @@ class TileFetcher:
             if not canvas:
                 log("ERROR: No canvas found!")
                 await self._save_session(output_path, session_name, bbox, location_info)
-                return found_data
+                return "blocked"  # no canvas = DOL didn't serve the app (throttle/load)
 
             canvas_box = await canvas.bounding_box()
             if not canvas_box:
                 log("ERROR: Could not get canvas bounding box!")
                 await self._save_session(output_path, session_name, bbox, location_info)
-                return found_data
+                return "blocked"  # no canvas = DOL didn't serve the app (throttle/load)
 
             # Calculate pan distances based on padded bbox (covers irregular boundary edges)
             lat_range = max_lat_padded - min_lat_padded
@@ -624,17 +633,30 @@ class TileFetcher:
                 log(f"\n{no_data_blanks} blank tile(s) are over no-parcel land — no retry needed.")
 
         except Exception as e:
-            log(f"Error: {e}")
+            if 'closed' in str(e).lower() or 'crash' in str(e).lower():
+                blocked = True
+                log(f"Session blocked/closed mid-scan (likely DOL throttle): {e}")
+            else:
+                log(f"Error: {e}")
         finally:
             # Save mission.json
             await self._save_session(output_path, session_name, bbox, location_info)
             # Close browser completely (fresh start next time)
-            await browser.close()
-            await playwright.stop()
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
 
-        # The wrapper (fetch_tiles) handles session-retry and the blank-tile
-        # camera fallback based on this return value.
-        return found_data
+        # Status drives the wrapper: 'found' = layer activated; 'no_parcel' =
+        # searched but no hit (retry elsewhere); 'blocked' = browser closed / DOL
+        # throttle (back off).
+        if found_data:
+            return "found"
+        return "blocked" if blocked else "no_parcel"
 
     def _make_url_fetcher(self, page):
         """Return an async fetch_url(url) -> bytes|None that GETs a WMS tile from
