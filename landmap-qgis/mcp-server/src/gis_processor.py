@@ -27,7 +27,7 @@ except ImportError:
 
 # Import boundary service for actual geometry
 from .boundary_service import BoundaryService
-from .tile_quality import is_blank_tile
+from .tile_quality import is_blank_tile, dominant_sort_key
 
 # Initialize boundary service
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -979,8 +979,11 @@ class GISProcessor:
             else:
                 valid_pairs = list(zip(raw_px, candidate_tiles))
 
-            # Sort descending by pixel size (coarsest first) so fine tiles overwrite gaps
-            valid_pairs.sort(key=lambda x: x[0], reverse=True)
+            # Composite dominant-zoom tiles ON TOP (last source wins). Sorting by
+            # distance-from-dominant descending puts the target-zoom tiles last, so
+            # over-zoomed fine tiles (few sparse parcels = "thin lines") don't cover
+            # the good tiles; off-zoom tiles only fill gaps where nothing closer exists.
+            valid_pairs.sort(key=lambda x: dominant_sort_key(x[0], dominant_px), reverse=True)
             px_sizes = [p[0] for p in valid_pairs]
             valid_tiles = [p[1] for p in valid_pairs]
 
@@ -1045,9 +1048,9 @@ class GISProcessor:
                 filelist_path = gis_dir / '_tile_filelist.txt'
                 filelist_path.write_text('\n'.join(vrt_paths), encoding='utf-8')
 
-                # Step 1: WGS84 mosaic — force output to dominant pixel size so the mosaic
-                # stays at a manageable resolution. Coarser gap-fill tiles get upsampled
-                # at most 8x; finer tiles contribute at dominant resolution (slight downsample).
+                # Step 1: WGS84 mosaic at the dominant pixel size so the grid stays
+                # manageable; the dominant-zoom tiles composite on top (see sort
+                # above) so they render sharp at native resolution.
                 wgs84_mosaic = gis_dir / 'tiles_mosaic_wgs84.vrt'
                 vrt_cmd = [gdalbuildvrt_exe]
                 if dominant_px:

@@ -18,6 +18,7 @@ Root cause these address (measured across the saved output/ sessions):
 from __future__ import annotations
 
 import json
+import math
 from io import BytesIO
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Union
@@ -128,6 +129,21 @@ def load_parcel_bboxes(geojson_paths) -> list:
             if bb:
                 boxes.append(bb)
     return boxes
+
+
+def dominant_sort_key(px, dominant):
+    """Log-scale distance of a tile's pixel size from the dominant resolution.
+
+    The mosaic composites the LAST source on top, so sorting tiles by this key
+    descending puts dominant-zoom tiles last (= on top). Over-zoomed fine tiles
+    (captured when the camera dove in during the double-click) otherwise win the
+    compositing and cover the good target-zoom tiles with only a few sparse
+    parcels — the "thin line" bug. Preferring the dominant zoom makes the good
+    tiles win; off-zoom tiles only fill gaps where nothing closer exists.
+    """
+    if not px or not dominant or px <= 0 or dominant <= 0:
+        return 0.0
+    return abs(math.log(px / dominant))
 
 
 def bbox_overlaps_any(tile_bbox, boxes) -> bool:

@@ -21,6 +21,7 @@ from src.tile_quality import (
     geometry_bbox,
     load_parcel_bboxes,
     bbox_overlaps_any,
+    dominant_sort_key,
 )
 
 
@@ -220,6 +221,23 @@ def test_load_parcel_bboxes(tmp_path):
     p = tmp_path / "parcels.geojson"
     p.write_text(json.dumps(gj), encoding="utf-8")
     assert load_parcel_bboxes([p]) == [(100.0, 13.0, 100.1, 13.1)]
+
+
+def test_dominant_sort_key_zero_at_dominant():
+    assert dominant_sort_key(1.0, 1.0) == 0.0
+
+
+def test_dominant_sort_key_symmetric_in_zoom():
+    # A tile 2x finer and one 2x coarser are equally far from the dominant zoom.
+    assert dominant_sort_key(0.5, 1.0) == pytest.approx(dominant_sort_key(2.0, 1.0))
+
+
+def test_dominant_zoom_tile_composites_last():
+    # Sorting by the key descending must put the dominant-zoom tile LAST (on top),
+    # so over-zoomed fine tiles don't cover the good tiles with sparse thin lines.
+    pxs = [4.0, 0.25, 2.0, 0.5, 1.0]
+    ordered = sorted(pxs, key=lambda p: dominant_sort_key(p, 1.0), reverse=True)
+    assert ordered[-1] == 1.0
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):
