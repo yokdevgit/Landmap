@@ -1,12 +1,16 @@
 # Landmap MCP Server
 
-MCP Server สำหรับดึงข้อมูลแผนที่ที่ดินจากกรมที่ดิน (landsmaps.dol.go.th) ผ่าน Claude Desktop
+MCP server สำหรับดึง **รูปแปลงที่ดิน (land parcels)** จากกรมที่ดิน (landsmaps.dol.go.th)
+ผ่าน Claude Desktop แล้วสร้างไฟล์ **QGIS project (.qgs) + Shapefile** ให้พร้อมใช้งาน
+
+ดึงข้อมูลแบบ **click-free** ผ่าน WFS ล้วน — ไม่ต้องดับเบิลคลิกบน 3D viewer
+(ซึ่งเป็นตัวที่โดนกรมที่ดิน rate-limit) จึงเร็วและเสถียรกว่าเดิมมาก
 
 ## Requirements
 
 - Python 3.10+
-- QGIS 3.36+ (ต้องการ `gdalbuildvrt` สำหรับสร้าง tile mosaic)
-- Playwright Chromium
+- Playwright Chromium (`playwright install chromium`)
+- QGIS 3.36+ (สำหรับ *เปิด* ไฟล์ `.qgs` — ไม่ต้องใช้ตอนดึงข้อมูลแล้ว)
 
 ## Installation
 
@@ -18,19 +22,19 @@ playwright install chromium
 
 ## Configuration
 
-### Environment variables
+ทุกอย่างมี default เป็น path ภายใน repo — **clone แล้วใช้ได้เลยโดยไม่ต้องตั้งค่า**
+ตั้ง env var (หรือไฟล์ `.env` ที่ repo root — โหลดอัตโนมัติ) เฉพาะเมื่อเก็บข้อมูลไว้ที่อื่น:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LANDMAP_SHAPEFILE_DIR` | `<repo>/shapefiles` | Path ไปยัง Thai admin boundary shapefiles |
-| `LANDMAP_OUTPUT_DIR` | `<repo>/output` | Path สำหรับบันทึก session output |
-| `LANDMAP_GDAL_BIN` | _(auto-detect)_ | Path ไปยัง directory ที่มี `gdalbuildvrt` — ตั้งเมื่อ QGIS ไม่ได้ติดตั้งใน `C:\Program Files\QGIS*` |
+| `LANDMAP_SHAPEFILE_DIR` | `<repo>/shapefiles` | Thai admin-boundary shapefiles |
+| `LANDMAP_OUTPUT_DIR` | `<repo>/output` | ที่บันทึก session output |
 
-ดู `.env.example` สำหรับ template
+ดู `.env.example` เป็น template (คัดลอกเป็น `.env`)
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`  
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json` ·
 **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
@@ -39,81 +43,84 @@ playwright install chromium
     "landmap": {
       "command": "python",
       "args": ["-m", "src.server"],
-      "cwd": "C:\\path\\to\\landmap\\landmap-qgis\\mcp-server",
-      "env": {
-        "LANDMAP_SHAPEFILE_DIR": "C:\\path\\to\\landmap\\shapefiles",
-        "LANDMAP_OUTPUT_DIR": "C:\\path\\to\\landmap\\output"
-      }
+      "cwd": "C:\\path\\to\\landmap\\landmap-qgis\\mcp-server"
     }
   }
 }
 ```
 
-> ถ้า `cwd` ตั้งค่าเป็น path ที่ถูกต้องและ `shapefiles/` กับ `output/` อยู่ใน repo root ตาม default layout ไม่จำเป็นต้องตั้ง env vars เลย
+> ถ้า `cwd` ถูกต้องและ `shapefiles/` + `output/` อยู่ใน repo ตาม default layout
+> ไม่ต้องตั้ง env vars เลย · restart Claude Desktop หลังแก้ config
 
-Restart Claude Desktop หลังแก้ไข config
+## Usage — พิมพ์ธรรมดาได้เลย
+
+ไม่ต้องระบุชื่อ tool — บอกพื้นที่ที่ต้องการก็พอ Claude จะเลือก `get_land_parcels` เอง:
+
+```
+User: ขอรูปแปลงที่ดินตำบลสีลม เขตบางรัก กรุงเทพ
+
+Claude: [get_land_parcels] → เสร็จแล้ว! (silom)
+        จำนวนแปลง: 9,087 · ไฟล์ ZIP: output/silom/silom_shp.zip
+```
+
+`get_land_parcels` ทำครบในขั้นตอนเดียว: หาขอบเขตพื้นที่ → ดึงแปลงที่ดินจาก WFS →
+reproject เป็น WGS84 → สร้าง shapefile + `.qgs` + zip
+
+เปิดไฟล์ `.qgs` ใน QGIS 3.36+ ได้ทันที (project เปิดตรงพื้นที่พร้อม 3 เลเยอร์):
+- **Parcel (DOL)** — แปลงที่ดินจาก WFS (vector ครบ คมชัด)
+- **Boundary** — ขอบเขตตำบล/อำเภอ
+- **OpenStreetMap** — basemap
 
 ## Available Tools
 
 | Tool | Description |
 |------|-------------|
+| **`get_land_parcels`** | **One-shot**: พื้นที่ → แปลงที่ดิน + shapefile + `.qgs` + zip (ใช้ตัวนี้เป็นหลัก) |
 | `list_provinces` | แสดงจังหวัดทั้งหมด 77 จังหวัด |
 | `list_districts` | แสดงอำเภอ/เขต ในจังหวัดที่ระบุ |
 | `list_subdistricts` | แสดงตำบล/แขวง ในอำเภอที่ระบุ |
-| `get_boundary_bbox` | หาขอบเขตพิกัด (BBOX) ของตำบล/อำเภอ/จังหวัด |
-| `search_location` | ค้นหาพื้นที่จากชื่อไทยหรืออังกฤษ |
-| `fetch_landmap_tiles` | ดึง tiles จากกรมที่ดิน |
-| `process_to_shapefiles` | แปลงข้อมูลเป็น shapefile + QGIS project (.qgs) |
-| `process_to_gis` | แปลง tiles เป็น PNG + PGW + QLR (legacy) |
+| `get_boundary_bbox` | หาขอบเขตพิกัด (BBOX) ของพื้นที่ |
+| `search_location` | ค้นหาพื้นที่จากชื่อไทย/อังกฤษ |
+| `fetch_parcels_wfs` | *(ขั้นตอนย่อย)* ดึงแปลงที่ดินอย่างเดียว (ไม่สร้าง `.qgs`) |
+| `process_to_shapefiles` | *(ขั้นตอนย่อย)* แปลง session ที่ดึงไว้เป็น shapefile + `.qgs` |
 | `list_sessions` | แสดงรายการ sessions ที่ดึงไว้แล้ว |
-
-## Usage Example
-
-```
-User: ดึงแผนที่ที่ดินตำบลบางแคเหนือ เขตบางแค กรุงเทพ
-
-Claude: [fetch_landmap_tiles → process_to_shapefiles]
-
-Output: output/bangkhaenuea/data/bangkhaenuea.qgs
-```
-
-เปิดไฟล์ `.qgs` ใน QGIS 3.36+ ได้เลย — project เปิดตรงพื้นที่ที่ถูกต้องพร้อม:
-- **DOL Tiles** — raster mosaic จาก WMS
-- **Boundary** — ขอบเขตตำบล/อำเภอ
-- **Parcel (DOL)** — แปลงที่ดินจาก WFS (ซ่อนไว้ by default, เปิดได้ใน Layers panel)
 
 ## Output Structure
 
 ```
 output/<session>/
+├── mission.json                 metadata (bbox, map sheets, location)
+├── features/
+│   └── utmmap_<id>.geojson       raw WFS parcels ต่อ map sheet
 ├── data/
 │   ├── parcel_dol.shp            แปลงที่ดิน (EPSG:4326)
-│   ├── parcel_dol_3857.geojson   แปลงที่ดิน (EPSG:3857 สำหรับ QGIS project)
 │   ├── boundary.shp              ขอบเขตพื้นที่ (EPSG:4326)
-│   ├── boundary_3857.geojson     ขอบเขตพื้นที่ (EPSG:3857 สำหรับ QGIS project)
-│   ├── grid_4000.csv             รายการ UTM map sheet IDs
+│   └── grid_4000.csv             รายการ UTM map-sheet IDs
+├── gis/
+│   ├── parcel_dol_3857.geojson   แปลงที่ดิน (EPSG:3857 สำหรับ QGIS)
+│   ├── boundary_3857.geojson     ขอบเขต (EPSG:3857)
 │   └── <session>.qgs             QGIS project file
-├── tiles_mosaic.vrt              GDAL VRT mosaic
-├── images/                       Raw tile PNGs
-└── <session>_shp.zip             ไฟล์ทั้งหมดใน ZIP
+└── <session>_shp.zip            ทุกไฟล์ใน ZIP
 ```
+
+## How it works (click-free WFS)
+
+1. เปิด DOL แค่พอให้ได้ Incapsula cookie (ไม่รอ 3D viewer)
+2. ถาม **grid layer** (`V_INDEX4000_<zone>_LANDNO`) ว่า bbox นี้อยู่ในระวางแผนที่ 1:4000 ใด
+   แล้วถอด `utmmap` จาก label ของระวาง (เช่น `"5136 III 6418"` → `513636418`)
+3. ดึงแปลงจาก **`V_PARCEL47/48`** ผ่าน WFS (BBOX-filtered, native UTM) หลายระวางพร้อมกัน
+4. reproject Indian 1975 → WGS84 ด้วย datum transform **"(2)"** (ตรงกับ basemap)
+
+ทั้งหมดวิ่งผ่าน WFS ที่ไม่โดน throttle จึงไม่ต้องดับเบิลคลิก
 
 ## Troubleshooting
 
-**MCP Server ไม่เชื่อมต่อ**
-- ตรวจสอบ `cwd` ใน `claude_desktop_config.json` ว่าชี้ไปยัง `landmap-qgis/mcp-server` ที่ถูกต้อง
-- ตรวจสอบว่าติดตั้ง dependencies ครบ (`pip install -e .`)
-- Restart Claude Desktop
+**MCP Server ไม่เชื่อมต่อ** — เช็ก `cwd` ใน config, ติดตั้ง deps (`pip install -e .`), restart Claude Desktop
 
-**ดึง tiles ไม่ได้ / ได้ tiles น้อยมาก**
-- ตรวจสอบการเชื่อมต่อ internet
-- เว็บกรมที่ดินอาจ rate limit — ลองใหม่อีกครั้ง (server ใช้ incognito browser ใหม่ทุก session)
+**ได้ข้อความ "โดน DOL จำกัดการเข้าถึงชั่วคราว"** — Incapsula rate-limit ชั่วคราว รอ 2-3 นาทีแล้วลองใหม่
 
-**QGIS project เปิดแล้ว layers ไม่แสดง**
-- ต้องใช้ QGIS 3.36 ขึ้นไป
-- ตรวจสอบว่า `tiles_mosaic.vrt` อยู่ใน session directory (ถ้าไม่มี gdalbuildvrt ทำงานล้มเหลว)
-- ตั้ง `LANDMAP_GDAL_BIN` ถ้า QGIS ไม่ได้ติดตั้งใน default location
+**"ไม่พบแปลงที่ดินในพื้นที่นี้"** — พื้นที่อาจอยู่นอกความครอบคลุมของกรมที่ดิน หรือ bbox ผิด
 
-**ไม่พบจังหวัด/อำเภอ/ตำบล**
-- ตรวจสอบว่า `LANDMAP_SHAPEFILE_DIR` ชี้ไปยัง directory ที่มี `.shp` files ถูกต้อง
-- ลองใช้ `search_location` เพื่อค้นหาชื่อที่ถูกต้อง
+**QGIS เปิดแล้ว layers ไม่แสดง** — ใช้ QGIS 3.36+ และเปิดจากไฟล์ `.qgs` ใน `gis/` (หรือแตกจาก zip)
+
+**ไม่พบจังหวัด/อำเภอ/ตำบล** — เช็ก `LANDMAP_SHAPEFILE_DIR`, ลอง `search_location` หาชื่อที่ถูกต้อง

@@ -1,26 +1,23 @@
 """
-GIS Processor - Convert tiles to GIS-ready files
+GIS Processor — convert DOL WFS parcels into GIS-ready files.
 
-Converts captured tiles to:
-- PNG images
-- PGW world files (georeferencing)
-- QLR layer definition (QGIS)
-- ZIP bundle for easy download
+Reads a session's WFS GeoJSON (features/) and produces:
+- parcel_dol.shp   — parcel polygons (reprojected Indian 1975 -> WGS84)
+- boundary.shp     — admin boundary polygon (from the local shapefile DB)
+- grid_4000.shp    — the 1:4000 map-sheet ids found
+- {session}.qgs    — QGIS project (OSM basemap + the vector layers)
+- {session}_shp.zip — everything bundled
 """
 
 import json
 import os
-import shutil
 import zipfile
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 import xml.etree.ElementTree as ET
 
 try:
     import geopandas as gpd
     import pandas as pd
-    from shapely.geometry import shape, mapping
     from shapely.ops import transform as shp_transform
     HAS_GEOPANDAS = True
 except ImportError:
@@ -28,7 +25,7 @@ except ImportError:
 
 # Import boundary service for actual geometry
 from .boundary_service import BoundaryService
-from .tile_quality import is_blank_tile, dominant_sort_key, dol_wgs84_transformer
+from .wfs_helpers import dol_wgs84_transformer
 
 # Initialize boundary service
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -40,7 +37,7 @@ boundary_service = BoundaryService(SHAPEFILE_DIR)
 
 
 class GISProcessor:
-    """Process captured tiles into GIS-ready files."""
+    """Convert a session's DOL WFS parcels into shapefiles + a QGIS project."""
 
     def __init__(self, output_dir: str):
         """
@@ -74,393 +71,6 @@ class GISProcessor:
 
         return sorted(sessions, key=lambda x: x.get("created_at", ""), reverse=True)
 
-    async def process_session(self, session_name: str) -> dict:
-        """
-        Process a session's tiles into GIS files.
-
-        Args:
-            session_name: Name of the session to process
-
-        Returns:
-            Dict with success status, tile_count, and zip_path
-        """
-        session_dir = self.output_dir / session_name
-        mission_file = session_dir / "mission.json"
-
-        if not mission_file.exists():
-            return {
-                "success": False,
-                "error": f"Session '{session_name}' not found"
-            }
-
-        try:
-            with open(mission_file, 'r', encoding='utf-8') as f:
-                mission_data = json.load(f)
-
-            tiles = mission_data.get("tiles", [])
-            if not tiles:
-                return {
-                    "success": False,
-                    "error": "No tiles found in session"
-                }
-
-            # Create GIS output directory
-            gis_dir = session_dir / "gis"
-            gis_dir.mkdir(exist_ok=True)
-
-            # Process each tile
-            processed_tiles = []
-            for i, tile in enumerate(tiles):
-                tile_result = self._process_tile(session_dir, gis_dir, tile, i)
-                if tile_result:
-                    processed_tiles.append(tile_result)
-
-            # Create boundary GeoJSON file (actual shape if location info available, else bbox)
-            bbox = mission_data.get("bbox", [])
-            location_info = mission_data.get("location")
-            bbox_geojson_path = None
-
-            if location_info or (bbox and len(bbox) == 4):
-                bbox_geojson_path = gis_dir / "boundary.geojson"
-                self._create_boundary_geojson(bbox_geojson_path, bbox, session_name, location_info)
-
-            # Generate QLR file
-            qlr_path = gis_dir / "landmap.qlr"
-            self._generate_qlr(qlr_path, processed_tiles, session_name, bbox_geojson_path)
-
-            # Create ZIP bundle
-            zip_path = session_dir / f"{session_name}_gis.zip"
-            self._create_zip(gis_dir, zip_path)
-
-            return {
-                "success": True,
-                "tile_count": len(processed_tiles),
-                "zip_path": str(zip_path)
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def _process_tile(
-        self,
-        session_dir: Path,
-        gis_dir: Path,
-        tile: dict,
-        index: int
-    ) -> Optional[dict]:
-        """Process a single tile - copy PNG and create PGW."""
-        try:
-            # Get source image path
-            source_path = session_dir / tile["fileName"]
-            if not source_path.exists():
-                return None
-
-            # Skip blank tiles (fully transparent OR near-empty) so they don't
-            # emit a PNG + world file and clutter the legacy QLR output.
-            if is_blank_tile(source_path):
-                return None
-
-            # Get tile info
-            bbox = tile["bbox"]  # [minLon, minLat, maxLon, maxLat]
-            width = tile.get("width", 256)
-            height = tile.get("height", 256)
-
-            # Copy PNG to GIS directory
-            png_filename = f"tile_{index}.png"
-            png_path = gis_dir / png_filename
-            shutil.copy2(source_path, png_path)
-
-            # Create PGW world file
-            pgw_path = gis_dir / f"tile_{index}.pgw"
-            self._create_world_file(pgw_path, bbox, width, height)
-
-            return {
-                "filename": png_filename,
-                "bbox": bbox,
-                "width": width,
-                "height": height
-            }
-
-        except Exception as e:
-            import sys; print(f"Error processing tile {index}: {e}", file=sys.stderr)
-            return None
-
-    def _create_world_file(
-        self,
-        pgw_path: Path,
-        bbox: list[float],
-        width: int,
-        height: int
-    ):
-        """
-        Create PGW world file for georeferencing.
-
-        World file format:
-        Line 1: pixel size in x direction (degrees/pixel)
-        Line 2: rotation about y axis (usually 0)
-        Line 3: rotation about x axis (usually 0)
-        Line 4: pixel size in y direction (negative, degrees/pixel)
-        Line 5: x coordinate of center of upper left pixel
-        Line 6: y coordinate of center of upper left pixel
-        """
-        min_lon, min_lat, max_lon, max_lat = bbox
-
-        # Calculate pixel sizes
-        pixel_size_x = (max_lon - min_lon) / width
-        pixel_size_y = (max_lat - min_lat) / height
-
-        # Calculate center of upper-left pixel
-        upper_left_x = min_lon + (pixel_size_x / 2)
-        upper_left_y = max_lat - (pixel_size_y / 2)
-
-        # Write world file
-        with open(pgw_path, 'w') as f:
-            f.write(f"{pixel_size_x:.12f}\n")     # pixel size X
-            f.write("0.0\n")                       # rotation Y
-            f.write("0.0\n")                       # rotation X
-            f.write(f"-{pixel_size_y:.12f}\n")    # pixel size Y (negative)
-            f.write(f"{upper_left_x:.12f}\n")     # upper-left X
-            f.write(f"{upper_left_y:.12f}\n")     # upper-left Y
-
-    def _create_boundary_geojson(
-        self,
-        geojson_path: Path,
-        bbox: list[float],
-        session_name: str,
-        location_info: dict = None
-    ):
-        """
-        Create a GeoJSON file with the boundary polygon.
-
-        Uses actual geometry from shapefile if location_info is provided,
-        otherwise falls back to simple bbox rectangle.
-        """
-        geojson = None
-
-        # Try to get actual geometry from boundary service
-        if location_info:
-            try:
-                province = location_info.get("province")
-                district = location_info.get("district")
-                subdistrict = location_info.get("subdistrict")
-
-                if province:
-                    gdf = boundary_service.get_geometry(province, district, subdistrict)
-                    if gdf is not None and not gdf.empty:
-                        # Convert to GeoJSON
-                        geojson = json.loads(gdf.to_json())
-                        # Update properties
-                        for feature in geojson.get("features", []):
-                            feature["properties"]["name"] = session_name
-                            feature["properties"]["description"] = "Administrative boundary"
-            except Exception as e:
-                import sys; print(f"Error getting geometry: {e}", file=sys.stderr)
-
-        # Fallback to bbox rectangle if no geometry found
-        if geojson is None and bbox and len(bbox) == 4:
-            min_lon, min_lat, max_lon, max_lat = bbox
-            geojson = {
-                "type": "FeatureCollection",
-                "features": [
-                    {
-                        "type": "Feature",
-                        "properties": {
-                            "name": session_name,
-                            "description": "Search area boundary (bbox)"
-                        },
-                        "geometry": {
-                            "type": "Polygon",
-                            "coordinates": [[
-                                [min_lon, min_lat],
-                                [max_lon, min_lat],
-                                [max_lon, max_lat],
-                                [min_lon, max_lat],
-                                [min_lon, min_lat]
-                            ]]
-                        }
-                    }
-                ]
-            }
-
-        if geojson:
-            with open(geojson_path, 'w', encoding='utf-8') as f:
-                json.dump(geojson, f, indent=2)
-
-    def _generate_qlr(
-        self,
-        qlr_path: Path,
-        tiles: list[dict],
-        session_name: str,
-        bbox_geojson_path: Optional[Path] = None
-    ):
-        """Generate QGIS Layer Definition file (.qlr)."""
-        # Create root element
-        qlr = ET.Element('qlr')
-
-        # Create layer-tree-group
-        layer_tree = ET.SubElement(qlr, 'layer-tree-group', {
-            'expanded': '1',
-            'checked': 'Qt::Checked',
-            'name': session_name
-        })
-
-        # Add custom properties
-        custom_props = ET.SubElement(layer_tree, 'customproperties')
-        prop = ET.SubElement(custom_props, 'Option', {'type': 'Map'})
-
-        # Create maplayers element
-        maplayers = ET.SubElement(qlr, 'maplayers')
-
-        # Add BBOX layer first (so it appears under tiles)
-        if bbox_geojson_path and bbox_geojson_path.exists():
-            bbox_layer_id = f"bbox_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-            # Add to layer tree
-            ET.SubElement(layer_tree, 'layer-tree-layer', {
-                'expanded': '0',
-                'checked': 'Qt::Checked',
-                'id': bbox_layer_id,
-                'name': 'Boundary',
-                'source': './boundary.geojson',
-                'providerKey': 'ogr'
-            })
-
-            # Add to maplayers
-            bbox_maplayer = ET.SubElement(maplayers, 'maplayer', {
-                'minimumScale': '0',
-                'maximumScale': '1e+08',
-                'type': 'vector',
-                'geometry': 'Polygon',
-                'hasScaleBasedVisibilityFlag': '0',
-                'styleCategories': 'AllStyleCategories'
-            })
-
-            ET.SubElement(bbox_maplayer, 'id').text = bbox_layer_id
-            ET.SubElement(bbox_maplayer, 'layername').text = 'Boundary'
-            ET.SubElement(bbox_maplayer, 'datasource').text = './boundary.geojson'
-            ET.SubElement(bbox_maplayer, 'provider', {'encoding': 'UTF-8'}).text = 'ogr'
-
-            # CRS for vector layer
-            bbox_srs = ET.SubElement(bbox_maplayer, 'srs')
-            bbox_spatial_ref = ET.SubElement(bbox_srs, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-            ET.SubElement(bbox_spatial_ref, 'wkt').text = 'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["geodetic latitude (Lat)",north],AXIS["geodetic longitude (Lon)",east],UNIT["degree",0.0174532925199433],ID["EPSG",4326]]'
-            ET.SubElement(bbox_spatial_ref, 'proj4').text = '+proj=longlat +datum=WGS84 +no_defs'
-            ET.SubElement(bbox_spatial_ref, 'authid').text = 'EPSG:4326'
-
-            # Blue styling for BBOX - simple fill with blue stroke, transparent fill
-            renderer = ET.SubElement(bbox_maplayer, 'renderer-v2', {
-                'type': 'singleSymbol',
-                'symbollevels': '0',
-                'enableorderby': '0'
-            })
-
-            symbols = ET.SubElement(renderer, 'symbols')
-            symbol = ET.SubElement(symbols, 'symbol', {
-                'type': 'fill',
-                'name': '0',
-                'alpha': '1',
-                'clip_to_extent': '1'
-            })
-
-            # Simple fill layer - blue stroke, light blue transparent fill
-            layer = ET.SubElement(symbol, 'layer', {
-                'pass': '0',
-                'class': 'SimpleFill',
-                'locked': '0'
-            })
-
-            # Blue fill with transparency (RGBA: 65, 105, 225, 50 = royal blue with ~20% opacity)
-            ET.SubElement(layer, 'prop', {'k': 'color', 'v': '65,105,225,50'})
-            # Blue stroke (RGBA: 0, 0, 255, 255 = solid blue)
-            ET.SubElement(layer, 'prop', {'k': 'outline_color', 'v': '0,0,255,255'})
-            ET.SubElement(layer, 'prop', {'k': 'outline_style', 'v': 'solid'})
-            ET.SubElement(layer, 'prop', {'k': 'outline_width', 'v': '0.5'})
-            ET.SubElement(layer, 'prop', {'k': 'style', 'v': 'solid'})
-
-            ET.SubElement(bbox_maplayer, 'blendMode').text = '0'
-
-        for i, tile in enumerate(tiles):
-            layer_id = f"tile_{i}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-            # Add to layer tree
-            ET.SubElement(layer_tree, 'layer-tree-layer', {
-                'expanded': '0',
-                'checked': 'Qt::Checked',
-                'id': layer_id,
-                'name': tile['filename'],
-                'source': f"./{tile['filename']}",
-                'providerKey': 'gdal'
-            })
-
-            # Add to maplayers
-            maplayer = ET.SubElement(maplayers, 'maplayer', {
-                'minimumScale': '0',
-                'maximumScale': '1e+08',
-                'type': 'raster',
-                'hasScaleBasedVisibilityFlag': '0',
-                'styleCategories': 'AllStyleCategories'
-            })
-
-            ET.SubElement(maplayer, 'id').text = layer_id
-            ET.SubElement(maplayer, 'layername').text = tile['filename']
-
-            # Data source
-            datasource = ET.SubElement(maplayer, 'datasource')
-            datasource.text = f"./{tile['filename']}"
-
-            # Provider
-            ET.SubElement(maplayer, 'provider').text = 'gdal'
-
-            # CRS
-            srs = ET.SubElement(maplayer, 'srs')
-            spatial_ref = ET.SubElement(srs, 'spatialrefsys', {'nativeFormat': 'Wkt'})
-            ET.SubElement(spatial_ref, 'wkt').text = 'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["geodetic latitude (Lat)",north],AXIS["geodetic longitude (Lon)",east],UNIT["degree",0.0174532925199433],ID["EPSG",4326]]'
-            ET.SubElement(spatial_ref, 'proj4').text = '+proj=longlat +datum=WGS84 +no_defs'
-            ET.SubElement(spatial_ref, 'srsid').text = '3452'
-            ET.SubElement(spatial_ref, 'srid').text = '4326'
-            ET.SubElement(spatial_ref, 'authid').text = 'EPSG:4326'
-            ET.SubElement(spatial_ref, 'description').text = 'WGS 84'
-            ET.SubElement(spatial_ref, 'projectionacronym').text = 'longlat'
-            ET.SubElement(spatial_ref, 'ellipsoidacronym').text = 'EPSG:7030'
-            ET.SubElement(spatial_ref, 'geographicflag').text = 'true'
-
-            # Extent
-            bbox = tile['bbox']
-            extent = ET.SubElement(maplayer, 'extent')
-            ET.SubElement(extent, 'xmin').text = str(bbox[0])
-            ET.SubElement(extent, 'ymin').text = str(bbox[1])
-            ET.SubElement(extent, 'xmax').text = str(bbox[2])
-            ET.SubElement(extent, 'ymax').text = str(bbox[3])
-
-            # Renderer (singleband color data)
-            pipe = ET.SubElement(maplayer, 'pipe')
-            renderer = ET.SubElement(pipe, 'rasterrenderer', {
-                'type': 'singlebandcolordata',
-                'opacity': '1',
-                'alphaBand': '-1',
-                'band': '1'
-            })
-
-            # Blending mode
-            ET.SubElement(maplayer, 'blendMode').text = '0'
-
-        # Write to file
-        tree = ET.ElementTree(qlr)
-        ET.indent(tree, space='  ')
-
-        with open(qlr_path, 'wb') as f:
-            tree.write(f, encoding='utf-8', xml_declaration=True)
-
-    def _create_zip(self, gis_dir: Path, zip_path: Path):
-        """Create ZIP bundle of all GIS files."""
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in gis_dir.iterdir():
-                if file_path.is_file():
-                    zipf.write(file_path, file_path.name)
-
     async def process_to_shapefiles(self, session_name: str) -> dict:
         """
         Convert captured WFS features into shapefiles + QGIS project.
@@ -493,7 +103,6 @@ class GISProcessor:
         location_info = mission_data.get("location", {})
         utmmaps = mission_data.get("utmmaps", [])
         utmmap_layers = mission_data.get("utmmapLayers", {})
-        tiles = mission_data.get("tiles", [])
 
         data_dir = session_dir / "data"
         data_dir.mkdir(exist_ok=True)
@@ -561,12 +170,8 @@ class GISProcessor:
             except Exception as e:
                 import sys; print(f"Error generating grid: {e}", file=sys.stderr)
 
-        # 4. Ensure gis/ folder exists (same tiles that work in process_to_gis)
+        # 4. Ensure the gis/ folder exists (vector-only session, no tiles).
         gis_dir = session_dir / "gis"
-        if not gis_dir.exists():
-            await self.process_session(session_name)
-        # A WFS-direct session has no tiles, so process_session creates nothing —
-        # make sure the folder exists so the vector-only .qgs can still be written.
         gis_dir.mkdir(parents=True, exist_ok=True)
 
         # Write boundary as GeoJSON to gis/ so the QGS can use it via relative path.
@@ -582,7 +187,7 @@ class GISProcessor:
         # 5. QGIS project file — placed in gis/ so relative tile paths work
         try:
             qgs_path = gis_dir / f"{session_name}.qgs"
-            self._generate_qgs_project(qgs_path, session_name, data_dir, results, bbox=bbox, tiles=tiles, gis_dir=gis_dir)
+            self._generate_qgs_project(qgs_path, session_name, data_dir, results, bbox=bbox, gis_dir=gis_dir)
             results['qgs'] = True
         except Exception as e:
             import sys; print(f"Error generating .qgs: {e}", file=sys.stderr)
@@ -604,28 +209,6 @@ class GISProcessor:
             "layers": list(results.keys())
         }
 
-    def _find_gdalbuildvrt(self) -> Optional[str]:
-        """Find gdalbuildvrt — checks LANDMAP_GDAL_BIN env var, then common QGIS locations, then PATH."""
-        import shutil, glob as _glob
-        # Explicit override via env var (set this if auto-detection fails)
-        gdal_bin = os.environ.get("LANDMAP_GDAL_BIN", "")
-        if gdal_bin:
-            exe = Path(gdal_bin) / "gdalbuildvrt.exe"
-            if exe.exists():
-                return str(exe)
-            # Maybe they set it to the full binary path directly
-            if Path(gdal_bin).exists():
-                return gdal_bin
-        # Auto-detect: glob all installed QGIS versions on Windows
-        for pattern in [
-            r"C:\Program Files\QGIS*\bin\gdalbuildvrt.exe",
-            r"C:\OSGeo4W*\bin\gdalbuildvrt.exe",
-        ]:
-            matches = sorted(_glob.glob(pattern), reverse=True)  # newest first
-            if matches:
-                return matches[0]
-        return shutil.which('gdalbuildvrt')
-
     def _generate_grid_shapefile(self, utmmaps: list[str], out_path: Path):
         """Generate a grid attribute table (no geometry) for utmmap IDs found."""
         import sys
@@ -637,7 +220,7 @@ class GISProcessor:
         df.to_csv(csv_path, index=False, encoding='utf-8')
         print(f"Saved grid mapsheet list to {csv_path}", file=sys.stderr)
 
-    def _generate_qgs_project(self, qgs_path: Path, session_name: str, data_dir: Path, layers: dict, bbox: list = None, tiles: list = None, session_dir: Path = None, gis_dir: Path = None):
+    def _generate_qgs_project(self, qgs_path: Path, session_name: str, data_dir: Path, layers: dict, bbox: list = None, session_dir: Path = None, gis_dir: Path = None):
         """Generate a QGIS 3.40-compatible project file (.qgs)."""
         import sys, math, uuid
 
@@ -959,175 +542,6 @@ class GISProcessor:
             ET.SubElement(ml, 'featureBlendMode').text = '0'
             ET.SubElement(ml, 'layerOpacity').text = '1'
 
-        # Raster tiles: write per-tile VRTs → WGS84 mosaic → warp to EPSG:3857.
-        # Filtering to the dominant pixel size avoids gdalbuildvrt picking the
-        # coarsest resolution and shrinking all fine tiles to ~20px (invisible).
-        mosaic_layer_id = None
-        mosaic_merc_bbox = None  # extent in EPSG:3857 meters for QGS
-        wgs84_wkt_vrt = ('GEOGCS["WGS 84",DATUM["WGS_1984",'
-                         'SPHEROID["WGS 84",6378137,298.257223563]],'
-                         'PRIMEM["Greenwich",0],'
-                         'UNIT["degree",0.0174532925199433]]')
-        if gis_dir and gis_dir.exists() and tiles and bbox and len(bbox) == 4:
-            sess_min_lon, sess_min_lat, sess_max_lon, sess_max_lat = bbox
-            # Small pad — only include tiles that fall inside (or just touch) the session bbox
-            pad = 0.05
-            candidate_tiles = [
-                t for t in tiles
-                if (t['bbox'][0] >= sess_min_lon - pad and
-                    t['bbox'][2] <= sess_max_lon + pad and
-                    t['bbox'][1] >= sess_min_lat - pad and
-                    t['bbox'][3] <= sess_max_lat + pad)
-            ]
-
-            # Compute pixel sizes, filter out background/basemap outliers, then sort
-            # coarsest-first so fine tiles composite on top (gdalbuildvrt last-source wins).
-            from collections import Counter
-            raw_px = [(t['bbox'][2]-t['bbox'][0]) / t.get('width', 256) for t in candidate_tiles]
-            dominant_px = Counter(round(p, 10) for p in raw_px).most_common(1)[0][0] if raw_px else None
-
-            # Keep only tiles within 8x of dominant (≤3 zoom levels away in either direction).
-            # This excludes Cesium background tiles (zoom 0-12) that span huge areas and would
-            # inflate the mosaic raster to billions of pixels when forced to the finest resolution.
-            if dominant_px:
-                valid_pairs = [(px, t) for px, t in zip(raw_px, candidate_tiles)
-                               if dominant_px / 8 <= px <= dominant_px * 8]
-            else:
-                valid_pairs = list(zip(raw_px, candidate_tiles))
-
-            # Composite dominant-zoom tiles ON TOP (last source wins). Sorting by
-            # distance-from-dominant descending puts the target-zoom tiles last, so
-            # over-zoomed fine tiles (few sparse parcels = "thin lines") don't cover
-            # the good tiles; off-zoom tiles only fill gaps where nothing closer exists.
-            valid_pairs.sort(key=lambda x: dominant_sort_key(x[0], dominant_px), reverse=True)
-            px_sizes = [p[0] for p in valid_pairs]
-            valid_tiles = [p[1] for p in valid_pairs]
-
-            print(f"Mosaic: {len(valid_tiles)}/{len(candidate_tiles)} tiles after zoom filter "
-                  f"(dominant={dominant_px:.8f} deg/px)", file=sys.stderr)
-
-            vrt_paths = []
-            skipped_transparent = 0
-            for tile in valid_tiles:
-                gis_png = Path(tile['fileName']).name
-                png_path = gis_dir / gis_png
-                # Skip tiles that are missing (blanks are no longer copied into
-                # gis/ by _process_tile) or blank (fully transparent OR near-empty).
-                # As fine tiles, blanks would win over useful coarse tiles in
-                # gdalbuildvrt (last-source-wins) and punch holes in the mosaic.
-                if not png_path.exists() or is_blank_tile(png_path):
-                    skipped_transparent += 1
-                    continue
-                vrt_name = gis_png.replace('.png', '.vrt')
-                vrt_path = gis_dir / vrt_name
-                tb = tile['bbox']
-                w = tile.get('width', 256)
-                h = tile.get('height', 256)
-                px = (tb[2] - tb[0]) / w
-                py = (tb[3] - tb[1]) / h
-                vrt_path.write_text(
-                    f'<VRTDataset rasterXSize="{w}" rasterYSize="{h}">\n'
-                    f'  <SRS>{wgs84_wkt_vrt}</SRS>\n'
-                    f'  <GeoTransform>{tb[0]}, {px}, 0.0, {tb[3]}, 0.0, -{py}</GeoTransform>\n'
-                    + ''.join(
-                        f'  <VRTRasterBand dataType="Byte" band="{b}" subClass="VRTSourcedRasterBand">\n'
-                        f'    <SimpleSource>\n'
-                        f'      <SourceFilename relativeToVRT="1">{gis_png}</SourceFilename>\n'
-                        f'      <SourceBand>{b}</SourceBand>\n'
-                        f'      <SourceProperties RasterXSize="{w}" RasterYSize="{h}" DataType="Byte" BlockXSize="{w}" BlockYSize="1"/>\n'
-                        f'      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>\n'
-                        f'      <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>\n'
-                        f'    </SimpleSource>\n'
-                        f'  </VRTRasterBand>\n'
-                        for b in range(1, 5)
-                    )
-                    + '</VRTDataset>\n',
-                    encoding='utf-8'
-                )
-                vrt_paths.append(str(vrt_path))
-
-            print(f"VRT list: {len(vrt_paths)} tiles included, {skipped_transparent} fully-transparent skipped",
-                  file=sys.stderr)
-            import subprocess
-            gdalbuildvrt_exe = self._find_gdalbuildvrt()
-            if gdalbuildvrt_exe:
-                qgis_bin = Path(gdalbuildvrt_exe).parent
-                gdalwarp_exe = str(qgis_bin / 'gdalwarp.exe')
-                gdalinfo_exe = str(qgis_bin / 'gdalinfo.exe')
-                if not Path(gdalwarp_exe).exists():
-                    gdalwarp_exe = None
-            else:
-                gdalwarp_exe = None
-                gdalinfo_exe = None
-
-            if gdalbuildvrt_exe and gdalwarp_exe and vrt_paths:
-                filelist_path = gis_dir / '_tile_filelist.txt'
-                filelist_path.write_text('\n'.join(vrt_paths), encoding='utf-8')
-
-                # Step 1: WGS84 mosaic at the dominant pixel size so the grid stays
-                # manageable; the dominant-zoom tiles composite on top (see sort
-                # above) so they render sharp at native resolution.
-                wgs84_mosaic = gis_dir / 'tiles_mosaic_wgs84.vrt'
-                vrt_cmd = [gdalbuildvrt_exe]
-                if dominant_px:
-                    vrt_cmd += ['-tr', str(dominant_px), str(dominant_px)]
-                vrt_cmd += ['-input_file_list', str(filelist_path), str(wgs84_mosaic)]
-                subprocess.run(vrt_cmd, capture_output=True, text=True)
-                if not wgs84_mosaic.exists():
-                    print("gdalbuildvrt failed — tiles omitted from QGS", file=sys.stderr)
-                    gdalwarp_exe = None  # skip warp step
-
-            if gdalbuildvrt_exe and gdalwarp_exe and vrt_paths:
-                # Step 2: Warp to EPSG:3857 (VRT = lazy, no pixel processing now)
-                mosaic_path = gis_dir / 'tiles_mosaic.vrt'
-                if mosaic_path.exists():
-                    mosaic_path.unlink()  # remove stale file so gdalwarp can write fresh
-                r = subprocess.run(
-                    [gdalwarp_exe, '-t_srs', 'EPSG:3857', '-r', 'bilinear',
-                     '-of', 'VRT', str(wgs84_mosaic), str(mosaic_path)],
-                    capture_output=True, text=True
-                )
-
-                if mosaic_path.exists():
-                    # Read extent from the EPSG:3857 mosaic
-                    ri = subprocess.run(
-                        [gdalinfo_exe, str(mosaic_path)],
-                        capture_output=True, text=True
-                    )
-                    # Parse corners from gdalinfo output
-                    import re
-                    m_ul = re.search(r'Upper Left\s+\(\s*([\d.]+),\s*([\d.]+)\)', ri.stdout)
-                    m_lr = re.search(r'Lower Right\s+\(\s*([\d.]+),\s*([\d.]+)\)', ri.stdout)
-                    if m_ul and m_lr:
-                        mosaic_merc_bbox = [
-                            float(m_ul.group(1)), float(m_lr.group(2)),
-                            float(m_lr.group(1)), float(m_ul.group(2))
-                        ]
-                    else:
-                        # Fallback: convert session bbox to EPSG:3857
-                        mosaic_merc_bbox = [
-                            lon_to_mercator_x(sess_min_lon), lat_to_mercator_y(sess_min_lat),
-                            lon_to_mercator_x(sess_max_lon), lat_to_mercator_y(sess_max_lat),
-                        ]
-                    print(f"Mosaic VRT (EPSG:3857) created, extent: {mosaic_merc_bbox}", file=sys.stderr)
-                    mosaic_layer_id = make_layer_id("DOL_Tiles")
-                    mosaic_tree = ET.SubElement(layer_tree_group, 'layer-tree-layer', {
-                        'name': 'DOL Tiles',
-                        'id': mosaic_layer_id,
-                        'checked': 'Qt::Checked',
-                        'source': './tiles_mosaic.vrt',
-                        'providerKey': 'gdal',
-                        'expanded': '0',
-                        'legend_exp': '',
-                        'legend_split_behavior': '0',
-                        'patch_size': '-1,-1',
-                    })
-                    cp = ET.SubElement(mosaic_tree, 'customproperties')
-                    ET.SubElement(cp, 'Option')
-                else:
-                    print(f"gdalwarp failed: {r.stderr}", file=sys.stderr)
-            else:
-                print("GDAL tools not found — tiles omitted from QGS", file=sys.stderr)
 
         # OSM at the bottom of layer tree
         osm_tree = ET.SubElement(layer_tree_group, 'layer-tree-layer', {
@@ -1144,31 +558,6 @@ class GISProcessor:
         osm_tree_cp = ET.SubElement(osm_tree, 'customproperties')
         ET.SubElement(osm_tree_cp, 'Option')
 
-        # Add mosaic tile maplayer — EPSG:3857, extent in meters
-        if mosaic_layer_id and mosaic_merc_bbox:
-            tml = ET.SubElement(map_layers, 'maplayer', {
-                'type': 'raster',
-                'autoRefreshMode': 'Disabled',
-                'hasScaleBasedVisibilityFlag': '0',
-                'styleCategories': 'AllStyleCategories',
-            })
-            ET.SubElement(tml, 'id').text = mosaic_layer_id
-            ET.SubElement(tml, 'layername').text = 'DOL Tiles'
-            ET.SubElement(tml, 'datasource').text = './tiles_mosaic.vrt'
-            ET.SubElement(tml, 'provider').text = 'gdal'
-            t_srs = ET.SubElement(tml, 'srs')
-            make_merc_srs(t_srs)
-            t_ext = ET.SubElement(tml, 'extent')
-            ET.SubElement(t_ext, 'xmin').text = str(mosaic_merc_bbox[0])
-            ET.SubElement(t_ext, 'ymin').text = str(mosaic_merc_bbox[1])
-            ET.SubElement(t_ext, 'xmax').text = str(mosaic_merc_bbox[2])
-            ET.SubElement(t_ext, 'ymax').text = str(mosaic_merc_bbox[3])
-            t_pipe = ET.SubElement(tml, 'pipe')
-            ET.SubElement(t_pipe, 'rasterrenderer', {
-                'type': 'multibandcolor', 'opacity': '1',
-                'redBand': '1', 'greenBand': '2', 'blueBand': '3', 'alphaBand': '4'
-            })
-            ET.SubElement(tml, 'blendMode').text = '0'
 
         # Add OSM maplayer
         osm_ml = ET.SubElement(map_layers, 'maplayer', {

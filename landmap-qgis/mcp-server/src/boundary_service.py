@@ -225,6 +225,15 @@ class BoundaryService:
         # 1 degree longitude ~= 110 km, 1 degree latitude ~= 111 km
         area_km2 = total_area_deg2 * 110 * 111
 
+        # Finest-level English/Thai name (used for auto session naming).
+        row0 = filtered.iloc[0]
+        if subdistrict:
+            name_en, name_th = row0.get('ADM3_EN'), row0.get('ADM3_TH')
+        elif district:
+            name_en, name_th = row0.get('ADM2_EN'), row0.get('ADM2_TH')
+        else:
+            name_en, name_th = row0.get('ADM1_EN'), row0.get('ADM1_TH')
+
         return {
             "bbox": [
                 float(total_bounds[0]),  # min_lon
@@ -232,7 +241,9 @@ class BoundaryService:
                 float(total_bounds[2]),  # max_lon
                 float(total_bounds[3])   # max_lat
             ],
-            "area_km2": area_km2
+            "area_km2": area_km2,
+            "name_en": str(name_en) if name_en is not None else None,
+            "name_th": str(name_th) if name_th is not None else None,
         }
 
     def search(self, query: str, limit: int = 20) -> list[dict]:
