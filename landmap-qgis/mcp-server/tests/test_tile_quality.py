@@ -34,7 +34,6 @@ from src.tile_quality import (
     parse_wms_utmmap,
     wfs_index_url,
     label_to_utmmap,
-    dol_true_epsg,
 )
 
 
@@ -323,9 +322,8 @@ def test_wfs_getfeature_url():
     assert "viewparams=utmmap:474619676" in u
     assert "outputFormat=application/json" in u
     assert "maxFeatures=50000" in u
-    assert "EPSG:24047" in u  # declared label (server does no reprojection)
-    # BBOX numbers are WGS84/UTM (no datum shift) so they match DOL's stored coords
-    assert "&BBOX=497" in u   # 24047 would be 498xxx; 32647 (true) is 497xxx
+    assert "EPSG:24047" in u
+    assert "&BBOX=498" in u  # native easting, verified against live WFS
 
 
 def test_parse_wms_utmmap():
@@ -358,20 +356,11 @@ def test_label_to_utmmap_bad():
 def test_wfs_index_url():
     u = wfs_index_url("https://x/wfs", 47, [98.9775, 18.781, 98.9934, 18.7896])
     assert "typeName=LANDSMAPS:V_INDEX4000_47_LANDNO" in u
-    assert "EPSG:24047" in u          # declared label
-    assert "&BBOX=497" in u           # WGS84/UTM numbers (no datum shift)
+    assert "EPSG:24047" in u
+    assert "&BBOX=498" in u
     # zone 48 picks the 48 grid + CRS
     u48 = wfs_index_url("https://x/wfs", 48, [104.8, 15.2, 104.9, 15.3])
     assert "V_INDEX4000_48_LANDNO" in u48 and "EPSG:24048" in u48
-
-
-def test_dol_true_epsg():
-    # DOL mislabels the datum: 240xx numbers are really WGS84/UTM 326xx (same zone).
-    assert dol_true_epsg(24047) == 32647
-    assert dol_true_epsg(24048) == 32648
-    assert dol_true_epsg("24047") == 32647   # accepts str
-    assert dol_true_epsg(4326) == 4326        # leaves other CRS untouched
-    assert dol_true_epsg(None) is None
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):

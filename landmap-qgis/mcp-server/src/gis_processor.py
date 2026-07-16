@@ -27,7 +27,7 @@ except ImportError:
 
 # Import boundary service for actual geometry
 from .boundary_service import BoundaryService
-from .tile_quality import is_blank_tile, dominant_sort_key, dol_true_epsg
+from .tile_quality import is_blank_tile, dominant_sort_key
 
 # Initialize boundary service
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -509,15 +509,6 @@ class GISProcessor:
                     try:
                         gdf = gpd.read_file(gf)
                         if not gdf.empty:
-                            # DOL labels the WFS output Indian 1975 UTM (EPSG:240xx)
-                            # but the coordinates carry NO datum shift — they are on
-                            # plain WGS84/UTM (EPSG:326xx), proven by a DOL WMS probe.
-                            # Trusting the label makes pyproj apply a ~500 m shift, so
-                            # override the datum (keep the zone) before reprojecting.
-                            declared = gdf.crs.to_epsg() if gdf.crs is not None else None
-                            true_epsg = dol_true_epsg(declared) if declared else None
-                            if true_epsg and true_epsg != declared:
-                                gdf = gdf.set_crs(true_epsg, allow_override=True)
                             gdfs.append(gdf)
                     except Exception as e:
                         import sys; print(f"Error reading {gf}: {e}", file=sys.stderr)
@@ -531,7 +522,7 @@ class GISProcessor:
                     parcel_gdf = parcel_gdf.drop_duplicates(subset=['geometry'])
                     # Keep only polygon/multipolygon features (WFS sometimes includes points)
                     parcel_gdf = parcel_gdf[parcel_gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])]
-                    # Reproject WGS84/UTM -> WGS84 lon/lat for QGIS (no datum shift).
+                    # Reproject to WGS84 so QGIS doesn't need datum shift for Indian 1975
                     parcel_gdf = parcel_gdf.to_crs("EPSG:4326")
                     parcel_gdf.to_file(data_dir / "parcel_dol.shp", encoding='utf-8')
                     parcel_count = len(parcel_gdf)
