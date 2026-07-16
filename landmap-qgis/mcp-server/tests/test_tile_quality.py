@@ -27,6 +27,9 @@ from src.tile_quality import (
     attempt_offset,
     native_epsg_for_layer,
     bbox_to_native,
+    zone_for_longitude,
+    activation_anchor,
+    ACTIVATION_ANCHORS,
 )
 
 
@@ -290,6 +293,20 @@ def test_bbox_to_native_matches_known_value():
     assert abs(n0 - 2076243.2) < 2
     assert abs(e1 - 499821.3) < 2
     assert abs(n1 - 2077194.6) < 2
+
+
+# ---------- parcel-layer activation anchors (per UTM zone) ----------
+def test_zone_for_longitude():
+    assert zone_for_longitude(100.5) == 47   # Bangkok (west)
+    assert zone_for_longitude(98.9) == 47     # Chiang Mai
+    assert zone_for_longitude(102.0) == 47    # boundary: 102 -> still 47
+    assert zone_for_longitude(102.1) == 48    # just east -> 48
+    assert zone_for_longitude(104.8) == 48    # Ubon (east)
+
+
+def test_activation_anchor_picks_zone_anchor():
+    assert activation_anchor([100.5, 13.7, 100.52, 13.72]) == ACTIVATION_ANCHORS[47]   # Bangkok
+    assert activation_anchor([104.8, 15.2, 104.9, 15.3]) == ACTIVATION_ANCHORS[48]      # Ubon
 
 
 def test_refetch_skips_blanks_with_no_parcel(tmp_path):

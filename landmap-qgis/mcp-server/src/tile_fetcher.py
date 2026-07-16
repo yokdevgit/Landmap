@@ -33,6 +33,8 @@ from .tile_quality import (
     attempt_offset,
     native_epsg_for_layer,
     bbox_to_native,
+    zone_for_longitude,
+    activation_anchor,
 )
 
 
@@ -495,6 +497,47 @@ class TileFetcher:
             if attempt > 0:
                 log(f"Session attempt {attempt + 1}: probing shifted targets (offset {off_dx:+.2f},{off_dy:+.2f})")
 
+            # Activate the parcel layer at a known-dense anchor first: a double-click
+            # there is sure to hit a parcel, so we don't depend on finding a
+            # clickable parcel in a possibly-sparse target. Once on, the layer stays
+            # on as we fly to the target. If it doesn't confirm (or doesn't carry
+            # over), the grid scan below clicks in-target as a fallback.
+            activated_at_anchor = False
+            a_lon, a_lat = activation_anchor(bbox)
+            a_zone = zone_for_longitude((bbox[0] + bbox[2]) / 2)
+            log(f"\nActivating parcel layer at zone-{a_zone} anchor {a_lat:.4f},{a_lon:.4f}...")
+            await page.evaluate(f"""
+                () => {{
+                    if (typeof viewer !== 'undefined' && viewer.camera) {{
+                        viewer.camera.flyTo({{
+                            destination: Cesium.Cartesian3.fromDegrees({a_lon}, {a_lat}, {ALTITUDE}),
+                            duration: 2
+                        }});
+                    }}
+                }}
+            """)
+            await asyncio.sleep(5)
+            a_found, _, a_used = await self._try_double_click_with_offsets(
+                page, canvas_box, spread_click_points(canvas_box, 5))
+            clicks_used_total += a_used
+            if a_found:
+                found_data = True
+                activated_at_anchor = True
+                log(f"Parcel layer activated at anchor ({a_used} clicks). Flying to target...")
+                await page.evaluate(f"""
+                    () => {{
+                        if (typeof viewer !== 'undefined' && viewer.camera) {{
+                            viewer.camera.flyTo({{
+                                destination: Cesium.Cartesian3.fromDegrees({center_lon}, {center_lat}, {ALTITUDE}),
+                                duration: 2
+                            }});
+                        }}
+                    }}
+                """)
+                await asyncio.sleep(5)
+            else:
+                log("Anchor activation not confirmed; will click in-target as fallback.")
+
             for scan_pass in range(TOTAL_PASSES):
                 cells_to_scan = [
                     (row, col)
@@ -582,6 +625,14 @@ class TileFetcher:
 
                 new_tiles = len(self.tiles) - tiles_at_pass_start
                 log(f"\nPass {scan_pass + 1} done: +{new_tiles} tiles, {len(cells_with_tiles)}/{total_cells} cells covered")
+
+                # If we activated at the anchor but nothing rendered at the target,
+                # the activation didn't carry over (e.g. a zone edge) — re-enable
+                # in-target clicking for the remaining passes (fallback).
+                if activated_at_anchor and len(self.tiles) == 0:
+                    log("Anchor activation didn't carry to the target — enabling in-target clicks.")
+                    found_data = False
+                    activated_at_anchor = False
 
                 if len(self.tiles) >= self.MAX_TILES_PER_SESSION:
                     break

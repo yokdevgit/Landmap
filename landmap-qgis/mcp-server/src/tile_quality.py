@@ -207,6 +207,26 @@ def bbox_to_native(bbox, epsg):
     return (min_e, min_n, max_e, max_n)
 
 
+# Known-dense spots (lon, lat) where a double-click reliably hits a parcel and
+# activates the layer. One per UTM parcel zone (activation is per-zone). Used to
+# turn the parcel layer ON before scanning a possibly-sparse target area.
+ACTIVATION_ANCHORS = {
+    47: (100.3955, 13.7201),   # Bang Khae Nuea, Bangkok (dense, proven)
+    48: (102.0828, 14.9717),   # Nai Mueang, Nakhon Ratchasima (Korat city core)
+}
+
+
+def zone_for_longitude(lon):
+    """DOL parcel UTM zone from longitude: > 102 deg E -> zone 48 (east/NE), else 47."""
+    return 48 if lon > 102 else 47
+
+
+def activation_anchor(bbox):
+    """(lon, lat) of the known-dense activation anchor for the target bbox's zone."""
+    lon = (bbox[0] + bbox[2]) / 2
+    return ACTIVATION_ANCHORS[zone_for_longitude(lon)]
+
+
 def attempt_offset(attempt):
     """Fractional (dx, dy) shift of the grid targets for each session-retry.
 
