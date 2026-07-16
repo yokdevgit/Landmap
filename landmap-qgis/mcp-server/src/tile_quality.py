@@ -211,8 +211,8 @@ def bbox_to_native(bbox, epsg):
 # activates the layer. One per UTM parcel zone (activation is per-zone). Used to
 # turn the parcel layer ON before scanning a possibly-sparse target area.
 ACTIVATION_ANCHORS = {
-    47: (100.3955, 13.7201),   # Bang Khae Nuea, Bangkok (dense, proven)
-    48: (102.0828, 14.9717),   # Nai Mueang, Nakhon Ratchasima (Korat city core)
+    47: (100.3967, 13.7203),   # Bang Khae Nuea, Bangkok — representative point (inside polygon)
+    48: (102.0686, 14.9716),   # Nai Mueang, Nakhon Ratchasima (Korat) — representative point
 }
 
 
