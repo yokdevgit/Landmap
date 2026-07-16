@@ -171,7 +171,8 @@ async def list_tools() -> list[Tool]:
                     "province": {"type": "string", "description": "ชื่อจังหวัด (ใช้แทน bbox ได้)"},
                     "district": {"type": "string", "description": "ชื่ออำเภอ (optional)"},
                     "subdistrict": {"type": "string", "description": "ชื่อตำบล (optional)"},
-                    "session_name": {"type": "string", "description": "ชื่อ session สำหรับบันทึกผลลัพธ์"}
+                    "session_name": {"type": "string", "description": "ชื่อ session สำหรับบันทึกผลลัพธ์"},
+                    "utmmap": {"type": "string", "description": "รหัส map sheet (utmmap) ถ้าทราบ — จะข้ามการ double-click (ไม่โดน throttle เลย)"}
                 },
                 "required": ["session_name"]
             }
@@ -350,7 +351,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 location_info = {"province": province, "district": district, "subdistrict": subdistrict}
 
             result = await tile_fetcher.fetch_parcels_wfs(
-                bbox=bbox, session_name=session_name, output_dir=OUTPUT_DIR, location_info=location_info
+                bbox=bbox, session_name=session_name, output_dir=OUTPUT_DIR,
+                location_info=location_info, utmmap=arguments.get("utmmap")
             )
 
             return [TextContent(

@@ -1060,13 +1060,16 @@ class TileFetcher:
 
             await asyncio.sleep(1)  # Be polite to the server
 
-    async def fetch_parcels_wfs(self, bbox, session_name, output_dir="output", location_info=None):
+    async def fetch_parcels_wfs(self, bbox, session_name, output_dir="output",
+                                location_info=None, utmmap=None, layer=None):
         """Lightweight WFS-direct fetch.
 
-        Activate the parcel layer with a few clicks just to read the map-sheet id,
-        then make ONE BBOX-filtered WFS call for the complete parcels — ~3-5 DOL
-        requests instead of ~50 for the full tile scan. No tiles are saved; the
-        vector geojson is the output. Returns {utmmaps, feature_count, output_path}.
+        If ``utmmap`` (the map-sheet id) is given, skip the double-click entirely
+        and go straight to the WFS — zero parcel-query load, immune to the DOL
+        double-click throttle. Otherwise activate the parcel layer with a few
+        clicks just to read the map-sheet id. Either way it's ONE BBOX-filtered
+        WFS call for the complete parcels — no tiles saved, vector geojson is the
+        output. Returns {utmmaps, feature_count, output_path}.
         """
         self.tiles = []
         self.captured_urls = set()
@@ -1078,6 +1081,14 @@ class TileFetcher:
         features_dir.mkdir(exist_ok=True)
         center_lon = (bbox[0] + bbox[2]) / 2
         center_lat = (bbox[1] + bbox[3]) / 2
+
+        # Known map sheet -> skip the (throttle-prone) double-click discovery.
+        given_utmmap = str(utmmap) if utmmap else None
+        if given_utmmap:
+            self.captured_utmmaps.add(given_utmmap)
+            self.utmmap_layers[given_utmmap] = layer or (
+                "LANDSMAPS:V_PARCEL48" if zone_for_longitude(center_lon) == 48
+                else "LANDSMAPS:V_PARCEL47")
 
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
@@ -1098,7 +1109,8 @@ class TileFetcher:
                 self.captured_utmmaps.add(utm)
                 if layer and utm not in self.utmmap_layers:
                     self.utmmap_layers[utm] = layer
-        page.on('response', on_response)
+        if not given_utmmap:
+            page.on('response', on_response)
 
         feature_count = 0
         try:
@@ -1122,15 +1134,16 @@ class TileFetcher:
                 }}
             """)
             await asyncio.sleep(4)
-            canvas = await page.query_selector('canvas')
-            canvas_box = await canvas.bounding_box() if canvas else None
-            if canvas_box:
-                for _ in range(2):  # a couple of tries to activate + reveal the map sheet
-                    await self._try_double_click_with_offsets(
-                        page, canvas_box, spread_click_points(canvas_box, 5))
-                    await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
-                    if self.captured_utmmaps:
-                        break
+            if not given_utmmap:
+                canvas = await page.query_selector('canvas')
+                canvas_box = await canvas.bounding_box() if canvas else None
+                if canvas_box:
+                    for _ in range(2):  # a couple of tries to activate + reveal the map sheet
+                        await self._try_double_click_with_offsets(
+                            page, canvas_box, spread_click_points(canvas_box, 5))
+                        await asyncio.sleep(3)  # let the parcel tiles (with utmmap) load
+                        if self.captured_utmmaps:
+                            break
 
             if self.captured_utmmaps:
                 log(f"Map sheet(s): {sorted(self.captured_utmmaps)} — fetching parcels via WFS...")
