@@ -21,13 +21,14 @@ try:
     import geopandas as gpd
     import pandas as pd
     from shapely.geometry import shape, mapping
+    from shapely.ops import transform as shp_transform
     HAS_GEOPANDAS = True
 except ImportError:
     HAS_GEOPANDAS = False
 
 # Import boundary service for actual geometry
 from .boundary_service import BoundaryService
-from .tile_quality import is_blank_tile, dominant_sort_key
+from .tile_quality import is_blank_tile, dominant_sort_key, dol_wgs84_transformer
 
 # Initialize boundary service
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -522,8 +523,17 @@ class GISProcessor:
                     parcel_gdf = parcel_gdf.drop_duplicates(subset=['geometry'])
                     # Keep only polygon/multipolygon features (WFS sometimes includes points)
                     parcel_gdf = parcel_gdf[parcel_gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])]
-                    # Reproject to WGS84 so QGIS doesn't need datum shift for Indian 1975
-                    parcel_gdf = parcel_gdf.to_crs("EPSG:4326")
+                    # Reproject Indian 1975 UTM -> WGS84 using the DOL datum transform
+                    # (the "(2)" variant; pyproj's default "(4)" lands parcels ~187 m
+                    # NW of the basemap — verified against streets + admin boundary).
+                    native_epsg = parcel_gdf.crs.to_epsg() if parcel_gdf.crs else None
+                    if native_epsg:
+                        tf = dol_wgs84_transformer(native_epsg)
+                        parcel_gdf['geometry'] = parcel_gdf.geometry.apply(
+                            lambda g: shp_transform(lambda x, y, z=None: tf.transform(x, y), g))
+                        parcel_gdf = parcel_gdf.set_crs("EPSG:4326", allow_override=True)
+                    else:
+                        parcel_gdf = parcel_gdf.to_crs("EPSG:4326")
                     parcel_gdf.to_file(data_dir / "parcel_dol.shp", encoding='utf-8')
                     parcel_count = len(parcel_gdf)
                     results['parcel_count'] = parcel_count

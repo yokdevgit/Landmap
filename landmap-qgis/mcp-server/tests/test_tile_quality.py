@@ -34,6 +34,7 @@ from src.tile_quality import (
     parse_wms_utmmap,
     wfs_index_url,
     label_to_utmmap,
+    dol_wgs84_transformer,
 )
 
 
@@ -351,6 +352,18 @@ def test_label_to_utmmap_bad():
     assert label_to_utmmap("garbage") is None
     assert label_to_utmmap("5136 Z 6418") is None   # unknown roman section
     assert label_to_utmmap("") is None
+
+
+def test_dol_wgs84_transformer_uses_variant_2():
+    # DOL parcels align to basemaps under the Indian1975->WGS84 "(2)" transform,
+    # not pyproj's default "(4)" (which is ~187 m NW). Verified vs streets/boundary.
+    t = dol_wgs84_transformer(24047)
+    assert "(2)" in t.description
+    lon, lat = t.transform(667362.88937339, 1516748.45877363)  # a Silom parcel corner
+    assert abs(lon - 100.544664) < 1e-4   # (2) position; (4) default would be 100.542995
+    assert abs(lat - 13.717807) < 1e-4
+    # zone 48 also resolves a "(2)" datum transform
+    assert "(2)" in dol_wgs84_transformer(24048).description
 
 
 def test_wfs_index_url():

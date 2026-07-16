@@ -269,6 +269,31 @@ def bbox_to_native(bbox, epsg):
     return (min_e, min_n, max_e, max_n)
 
 
+# The DOL parcel datum transform to use. pyproj defaults to "Indian 1975 to
+# WGS 84 (4)" (a 7-parameter fit) but DOL's parcels only line up with basemaps
+# (streets + the admin boundary, verified for Si Lom) under the 3-parameter
+# "(2)" variant — "(4)" sits ~187 m NW of where the land actually is.
+DOL_DATUM_TRANSFORM = "Indian 1975 to WGS 84 (2)"
+
+
+def dol_wgs84_transformer(native_epsg):
+    """pyproj Transformer from a DOL parcel CRS (Indian 1975 UTM, EPSG:240xx) to
+    WGS84 (EPSG:4326), forcing the DOL_DATUM_TRANSFORM datum operation. Selected by
+    name (not list index) so a pyproj registry reorder can't silently pick the
+    wrong one. Falls back to pyproj's default transformer if the named op is
+    unavailable. Use this instead of GeoDataFrame.to_crs(4326) for DOL parcels."""
+    from pyproj import Transformer
+    from pyproj.transformer import TransformerGroup
+    try:
+        tg = TransformerGroup(native_epsg, 4326, always_xy=True)
+        for t in tg.transformers:
+            if DOL_DATUM_TRANSFORM in (t.description or ""):
+                return t
+    except Exception:
+        pass
+    return Transformer.from_crs(native_epsg, 4326, always_xy=True)
+
+
 # Known-dense spots (lon, lat) where a double-click reliably hits a parcel and
 # activates the layer. One per UTM parcel zone (activation is per-zone). Used to
 # turn the parcel layer ON before scanning a possibly-sparse target area.
